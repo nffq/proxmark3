@@ -30,8 +30,10 @@
 #include "crapto1/crapto1.h"
 #include "protocols.h"
 #include "cmdhficlass.h"
+#include "cmdhfcalypso.h"
 #include "mifare/mifaredefault.h"  // mifare consts
 #include "cmdhfseos.h"
+#include "iso7816/apduinfo.h"
 
 enum MifareAuthSeq {
     masNone,
@@ -199,6 +201,46 @@ uint8_t iclass_CRC_check(bool isResponse, uint8_t *d, uint8_t n) {
 }
 
 
+static int annotateEcp(char *exp, size_t size, const uint8_t *cmd, uint8_t cmdsize) {
+    if (cmdsize < 7 || cmd[0] != ECP_HEADER) {
+        return PM3_ESOFT;
+    }
+
+    // Byte 0 is a header
+    // Byte 1 indicates format version
+    // Version 0x01 format is 7 bytes long (including CRC)
+    // Version 0x02 format is at least 7 bytes long, including CRC.
+    // The low nibble of byte 2 defines extra payload length.
+    if (cmd[1] == 0x01 && cmdsize == 7) {
+        snprintf(exp, size, "ECP1");
+        return PM3_SUCCESS;
+    }
+
+    if (cmd[1] == 0x02 && cmdsize == (cmd[2] & 0x0F) + 7) {
+        // Byte 3 is the reader type
+        switch (cmd[3]) {
+            case 0x01:
+                snprintf(exp, size, "ECP2 (Transit)");
+                break;
+            case 0x02:
+                snprintf(exp, size, "ECP2 (Access)");
+                break;
+            case 0x03:
+                snprintf(exp, size, "ECP2 (Identity)");
+                break;
+            case 0x05:
+                snprintf(exp, size, "ECP2 (AirDrop)");
+                break;
+            default:
+                snprintf(exp, size, "ECP2");
+                break;
+        }
+        return PM3_SUCCESS;
+    }
+
+    return PM3_ESOFT;
+}
+
 int applyIso14443a(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool is_response) {
 
     if (is_response == false) {
@@ -208,35 +250,8 @@ int applyIso14443a(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool i
             return PM3_SUCCESS;
         }
 
-        if (cmdsize >= 7 && cmd[0] == ECP_HEADER) {
-            // Byte 0 is a header
-            // Byte 1 indicates format version
-            // Version 0x01 format is 7 bytes long (including crc)
-            // Version 0x02 format is at least 7 bytes long (including crc). First 4 bits of byte 2 define extra payload length
-            if (cmd[1] == 0x01 && cmdsize == 7) {
-                snprintf(exp, size, "ECP1");
-                return PM3_SUCCESS;
-            } else if (cmd[1] == 0x02 && cmdsize == (cmd[2] & 0x0F) + 7) {
-                // Byte 3 is the reader type
-                switch (cmd[3]) {
-                    case 0x01:
-                        snprintf(exp, size, "ECP2 (Transit)");
-                        break;
-                    case 0x02:
-                        snprintf(exp, size, "ECP2 (Access)");
-                        break;
-                    case 0x03:
-                        snprintf(exp, size, "ECP2 (Identity)");
-                        break;
-                    case 0x05:
-                        snprintf(exp, size, "ECP2 (AirDrop)");
-                        break;
-                    default:
-                        snprintf(exp, size, "ECP2");
-                        break;
-                }
-                return PM3_SUCCESS;
-            }
+        if (annotateEcp(exp, size, cmd, cmdsize) == PM3_SUCCESS) {
+            return PM3_SUCCESS;
         }
 
         gs_ntag_i2c_state = 0;
@@ -409,7 +424,7 @@ int applyIso14443a(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool i
             case MIFARE_ULC_WRITE : {
                 if (cmd[1] < 0x21)
                     snprintf(exp, size, "WRITEBLOCK(" _MAGENTA_("%d") ")", cmd[1]);
-                else
+                else if (cmdsize >= 6)
                     // outside limits, useful for some tags...
                     snprintf(exp, size, "WRITEBLOCK(" _MAGENTA_("%d") ") (%s)", cmd[1], sprint_hex_inrow(cmd + 2, 4));
                 break;
@@ -422,10 +437,12 @@ int applyIso14443a(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool i
                 break;
             }
             case MIFARE_ULEV1_INCR_CNT : {
-                if (cmd[1] < 5)
-                    snprintf(exp, size, "INCR(" _MAGENTA_("%d") ")", cmd[1]);
-                else
+                if (cmd[1] < 5) {
+                    uint32_t v = MemLeToUint3byte(cmd + 2);
+                    snprintf(exp, size, "INCR CNT(" _MAGENTA_("%d") ") %u", cmd[1], v);
+                } else {
                     snprintf(exp, size, "?");
+                }
                 break;
             }
             case MIFARE_ULEV1_READSIG:
@@ -928,43 +945,331 @@ void annotateIso7816(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool
     }
 }
 
+static bool iso14443_4_get_i_block_inf(uint8_t *cmd, uint8_t cmdsize, bool is_response, const uint8_t **inf, size_t *inf_len) {
+    (void)is_response;
+    size_t frame_len = cmdsize;
+    if (frame_len < 1 || (cmd[0] & 0xC0) != 0x00 || (cmd[0] & 0x02) != 0x02) {
+        return false;
+    }
+
+    size_t pos = 1;
+    if ((cmd[0] & 0x08) == 0x08) {
+        pos++;
+    }
+    if ((cmd[0] & 0x04) == 0x04) {
+        pos++;
+    }
+    if (pos >= frame_len) {
+        return false;
+    }
+
+    *inf = cmd + pos;
+    if (inf_len != NULL) {
+        *inf_len = frame_len - pos;
+    }
+    return true;
+}
+
+static bool annotateIso14443_s_r_block(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool is_response, bool show_block_number) {
+    (void)is_response;
+    size_t frame_len = cmdsize;
+    if (frame_len < 1 || frame_len > 4) {
+        return false;
+    }
+
+    if ((cmd[0] & 0xC0) == 0xC0) {
+        switch (cmd[0] & 0x30) {
+            case 0x00:
+                snprintf(exp, size, "S-block DESELECT");
+                break;
+            case 0x30:
+                snprintf(exp, size, "S-block WTX");
+                break;
+            default:
+                snprintf(exp, size, "S-block");
+                break;
+        }
+        return true;
+    }
+
+    if ((cmd[0] & 0xD0) == 0x80) {
+        if (show_block_number) {
+            snprintf(exp, size, (cmd[0] & 0x10) ? "R-block NACK(%d)" : "R-block ACK(%d)", cmd[0] & 0x01);
+        } else {
+            snprintf(exp, size, (cmd[0] & 0x10) ? "R-block NACK" : "R-block ACK");
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static void calypso_sfi_file_ref(char *out, size_t out_len, uint8_t p2, uint8_t current_mask, uint8_t sfi_mask) {
+    if (p2 == current_mask) {
+        snprintf(out, out_len, "current EF");
+    } else if ((p2 & 0x07) == sfi_mask && (p2 >> 3) != 0) {
+        snprintf(out, out_len, "sfi=%u", p2 >> 3);
+    } else {
+        snprintf(out, out_len, "p2=%02X", p2);
+    }
+}
+
+static void calypso_binary_ref(char *out, size_t out_len, uint8_t ins, uint8_t p1, uint8_t p2) {
+    if (ins == CALYPSO_READ_BINARY || ins == CALYPSO_WRITE_BINARY || ins == CALYPSO_UPDATE_BINARY) {
+        if ((p1 & 0x80) == 0x80) {
+            snprintf(out, out_len, "sfi=%u, off=%u", p1 & 0x1F, p2);
+        } else {
+            snprintf(out, out_len, "off=%u", ((p1 & 0x7F) << 8) | p2);
+        }
+    } else if ((p2 & 0x80) == 0x80) {
+        snprintf(out, out_len, "sfi=%u", p2 & 0x1F);
+    } else if (p2 == 0x00) {
+        snprintf(out, out_len, "current EF");
+    } else {
+        snprintf(out, out_len, "p2=%02X", p2);
+    }
+}
+
+static bool annotateCalypsoApdu(char *exp, size_t size, const uint8_t *apdu, size_t apdu_len) {
+    if (apdu_len < 4) {
+        return false;
+    }
+
+    uint8_t decoded_data[1024] = {0};
+    APDU_t decoded = {0};
+    bool decoded_ok = false;
+    if (apdu_len <= sizeof(decoded_data)) {
+        memcpy(decoded_data, apdu, apdu_len);
+        decoded_ok = APDUDecode(decoded_data, (int)apdu_len, &decoded) == 0;
+        if (decoded_ok == false && apdu_len > 2) {
+            decoded_ok = APDUDecode(decoded_data, (int)(apdu_len - 2), &decoded) == 0;
+        }
+    }
+
+    uint8_t ins = decoded_ok ? decoded.ins : apdu[1];
+    uint8_t p1 = decoded_ok ? decoded.p1 : apdu[2];
+    uint8_t p2 = decoded_ok ? decoded.p2 : apdu[3];
+
+    switch (ins) {
+        case CALYPSO_SELECT: {
+            if (decoded_ok && (p1 == 0x00 || p1 == 0x08 || p1 == 0x09)) {
+                char ref[64] = "current DF"; // Select for empty LID implies current DF
+                if (decoded.lc == 2) {
+                    uint16_t fid = (decoded.data[0] << 8) | decoded.data[1];
+                    if (fid == 0x3F00) {
+                        snprintf(ref, sizeof(ref), "MF");
+                    } else if (fid != 0x0000) {
+                        snprintf(ref, sizeof(ref), p1 == 0x08 ? "path=%04X" : "lid=%04X", fid);
+                    }
+                } else if (decoded.lc > 0) {
+                    snprintf(ref, sizeof(ref), p1 == 0x08 ? "path=%s" : "data=%s", sprint_hex_inrow(decoded.data, decoded.lc));
+                }
+                snprintf(exp, size, "SELECT FILE (%s)", ref);
+            } else if (p1 == 0x04) {
+                const char *mode = (p2 == 0x02 || p2 == 0x0E) ? "next" : "first";
+                const char *fci = (p2 == 0x0C || p2 == 0x0E) ? "N" : "Y";
+                if (decoded_ok && decoded.lc > 0) {
+                    snprintf(exp, size, "SELECT APP (aid=%s, mode=%s, fci=%s)", sprint_hex_inrow(decoded.data, decoded.lc), mode, fci);
+                } else {
+                    snprintf(exp, size, "SELECT APP (mode=%s, fci=%s)", mode, fci);
+                }
+            } else if (p1 == 0x02 && (p2 == 0x00 || p2 == 0x02)) {
+                snprintf(exp, size, p2 == 0x02 ? "SELECT FILE (next EF)" : "SELECT FILE (first EF)");
+            } else if (p1 == 0x03) {
+                snprintf(exp, size, "SELECT FILE (parent DF)");
+            } else {
+                snprintf(exp, size, "SELECT");
+            }
+            return true;
+        }
+        case CALYPSO_INVALIDATE:
+            snprintf(exp, size, "INVALIDATE");
+            return true;
+        case CALYPSO_REHABILITATE:
+            snprintf(exp, size, "REHABILITATE");
+            return true;
+        case CALYPSO_GET_DATA: {
+            uint16_t tag = (p1 << 8) | p2;
+            const char *name = CalypsoGetDataTagName(tag);
+            if (name) {
+                snprintf(exp, size, "GET DATA (tag=%04X - %s)", tag, name);
+            } else {
+                snprintf(exp, size, "GET DATA (tag=%04X)", tag);
+            }
+            return true;
+        }
+        case CALYPSO_APPEND_RECORD: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x00, 0x00);
+            snprintf(exp, size, "APPEND RECORD (%s)", ref);
+            return true;
+        }
+        case CALYPSO_DECREASE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x00, 0x00);
+            snprintf(exp, size, "DECREASE (%s, counter=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_DECREASE_MULTIPLE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x00, 0x00);
+            snprintf(exp, size, "DECREASE MULTIPLE (%s)", ref);
+            return true;
+        }
+        case CALYPSO_INCREASE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x00, 0x00);
+            snprintf(exp, size, "INCREASE (%s, counter=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_INCREASE_MULTIPLE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x00, 0x00);
+            snprintf(exp, size, "INCREASE MULTIPLE (%s)", ref);
+            return true;
+        }
+        case CALYPSO_READ_RECORD: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x04, 0x04);
+            snprintf(exp, size, "READ RECORD (%s, rec=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_READ_RECORD_MULTIPLE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x05, 0x05);
+            snprintf(exp, size, "READ RECORDS (%s, rec=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_SEARCH_RECORD_MULTIPLE: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x07, 0x07);
+            snprintf(exp, size, "SEARCH RECORD (%s, rec=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_READ_BINARY:
+        case CALYPSO_READ_BINARY_EXTENDED: {
+            char ref[20];
+            calypso_binary_ref(ref, sizeof(ref), ins, p1, p2);
+            snprintf(exp, size, "READ BINARY (%s)", ref);
+            return true;
+        }
+        case CALYPSO_WRITE_BINARY: {
+            char ref[20];
+            calypso_binary_ref(ref, sizeof(ref), ins, p1, p2);
+            snprintf(exp, size, "WRITE BINARY (%s)", ref);
+            return true;
+        }
+        case CALYPSO_UPDATE_BINARY: {
+            char ref[20];
+            calypso_binary_ref(ref, sizeof(ref), ins, p1, p2);
+            snprintf(exp, size, "UPDATE BINARY (%s)", ref);
+            return true;
+        }
+        case CALYPSO_UPDATE_RECORD: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x04, 0x04);
+            snprintf(exp, size, "UPDATE RECORD (%s, rec=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_WRITE_RECORD: {
+            char ref[20];
+            calypso_sfi_file_ref(ref, sizeof(ref), p2, 0x04, 0x04);
+            snprintf(exp, size, "WRITE RECORD (%s, rec=%u)", ref, p1);
+            return true;
+        }
+        case CALYPSO_GET_CHALLENGE:
+            snprintf(exp, size, "GET CHALLENGE");
+            return true;
+        case CALYPSO_OPEN_SESSION:
+            snprintf(exp, size, "OPEN SESSION");
+            return true;
+        case CALYPSO_CLOSE_SESSION:
+            snprintf(exp, size, "CLOSE SESSION");
+            return true;
+        case CALYPSO_VERIFY_PIN:
+            snprintf(exp, size, "VERIFY PIN");
+            return true;
+        case CALYPSO_RESET_RETRY_COUNTER:
+            snprintf(exp, size, "RESET RETRY COUNTER");
+            return true;
+        case CALYPSO_CHANGE_PIN:
+            if (p1 == 0x00 && (p2 == 0x04 || p2 == 0xFF)) {
+                snprintf(exp, size, "CHANGE PIN");
+            } else if (p1 == 0x00 && p2 >= 0x01 && p2 <= 0x03) {
+                snprintf(exp, size, "CHANGE KEY");
+            } else {
+                snprintf(exp, size, "CHANGE PIN/KEY");
+            }
+            return true;
+        case CALYPSO_SV_GET:
+            snprintf(exp, size, "SV GET");
+            return true;
+        case CALYPSO_SV_DEBIT:
+            snprintf(exp, size, "SV DEBIT (challenge=%02X%02X)", p1, p2);
+            return true;
+        case CALYPSO_SV_RELOAD:
+            snprintf(exp, size, "SV RELOAD (challenge=%02X%02X)", p1, p2);
+            return true;
+        case CALYPSO_SV_UN_DEBIT:
+            snprintf(exp, size, "SV UNDEBIT (challenge=%02X%02X)", p1, p2);
+            return true;
+        case CALYPSO_SAM_SV_DEBIT:
+            snprintf(exp, size, "SAM SV DEBIT");
+            return true;
+        case CALYPSO_SAM_SV_RELOAD:
+            snprintf(exp, size, "SAM SV RELOAD");
+            return true;
+        case CALYPSO_GET_RESPONSE:
+            snprintf(exp, size, "GET RESPONSE");
+            return true;
+        default:
+            return false;
+    }
+}
+
+void annotateCalypso(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool is_response) {
+    if (cmdsize < 1 || is_response) {
+        return;
+    }
+
+    if (applyIso14443a(exp, size, cmd, cmdsize, false) == PM3_SUCCESS) {
+        return;
+    }
+
+    if (cmd[0] == ISO14443B_REQB || cmd[0] == ISO14443B_ATTRIB || cmd[0] == ISO14443B_HALT) {
+        annotateIso14443b(exp, size, cmd, cmdsize);
+        return;
+    }
+
+    if (annotateIso14443_s_r_block(exp, size, cmd, cmdsize, false, false)) {
+        return;
+    }
+
+    const uint8_t *inf = NULL;
+    size_t inf_len = 0;
+    if (iso14443_4_get_i_block_inf(cmd, cmdsize, false, &inf, &inf_len)) {
+        annotateCalypsoApdu(exp, size, inf, inf_len);
+    }
+}
+
 // MIFARE DESFire
 void annotateMfDesfire(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
 
     // it's basically a ISO14443a tag, so try annotation from there
     if (applyIso14443a(exp, size, cmd, cmdsize, false) != PM3_SUCCESS) {
 
-        // S-block 11xxx010
-        if ((cmd[0] & 0xC0) && (cmdsize == 3)) {
-            switch ((cmd[0] & 0x30)) {
-                case 0x00:
-                    snprintf(exp, size, "S-block DESELECT");
-                    break;
-                case 0x30:
-                    snprintf(exp, size, "S-block WTX");
-                    break;
-                default:
-                    snprintf(exp, size, "S-block");
-                    break;
-            }
-        }
-        // R-block (ack) 101xx01x
-        else if (((cmd[0] & 0xB0) == 0xA0) && (cmdsize > 2)) {
-            if ((cmd[0] & 0x10) == 0)
-                snprintf(exp, size, "R-block ACK(%d)", (cmd[0] & 0x01));
-            else
-                snprintf(exp, size, "R-block NACK(%d)", (cmd[0] & 0x01));
+        if (annotateIso14443_s_r_block(exp, size, cmd, cmdsize, false, true)) {
+            return;
         }
         // I-block 000xCN1x
         else if (((cmd[0] & 0xC0) == 0x00) && (cmdsize > 2)) {
 
-            // PCB [CID] [NAD] [INF] CRC CRC
-            int pos = 1;
-            if ((cmd[0] & 0x08) == 0x08)  // cid byte following
-                pos++;
+            const uint8_t *inf = NULL;
+            if (iso14443_4_get_i_block_inf(cmd, cmdsize, false, &inf, NULL) == false) {
+                return;
+            }
 
-            if ((cmd[0] & 0x04) == 0x04)  // nad byte following
-                pos++;
+            int pos = inf - cmd;
 
             for (uint8_t i = 0; i < 2; i++, pos++) {
                 bool found_annotation = true;
@@ -1192,7 +1497,7 @@ void annotateMfDesfire(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
                         break;
                     case MFDES_CHANGE_KEY:
                         if (data_size >= 1) {
-                            snprintf(exp, size, "CHANGE KEY (keyNo %u)", data[0]);
+                            snprintf(exp, size, "CHANGE KEY (keyNo %u)", (uint8_t)(data[0] & 0x3Fu));
                         } else {
                             snprintf(exp, size, "CHANGE KEY");
                         }
@@ -1355,13 +1660,12 @@ void annotateMfPlus(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
     // ok this part is copy paste from annotateMfDesfire, it seems to work for MIFARE Plus also
     if (((cmd[0] & 0xC0) == 0x00) && (cmdsize > 2)) {
 
-        // PCB [CID] [NAD] [INF] CRC CRC
-        int pos = 1;
-        if ((cmd[0] & 0x08) == 0x08)  // cid byte following
-            pos++;
+        const uint8_t *inf = NULL;
+        if (iso14443_4_get_i_block_inf(cmd, cmdsize, false, &inf, NULL) == false) {
+            return;
+        }
 
-        if ((cmd[0] & 0x04) == 0x04)  // nad byte following
-            pos++;
+        int pos = inf - cmd;
 
         for (uint8_t i = 0; i < 2; i++, pos++) {
             bool found_annotation = true;
@@ -1744,6 +2048,9 @@ void annotateIso14443b(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
                 break;
             }
         default:
+            if (annotateEcp(exp, size, cmd, cmdsize) == PM3_SUCCESS) {
+                break;
+            }
             snprintf(exp, size, "?");
             break;
     }
@@ -1818,6 +2125,7 @@ void annotateSeos(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool is
         if (memcmp(cmd + pos, "\x00\xA4\x04\x00", 4) == 0) {
             uint8_t n = cmd[pos + 4];
             snprintf(exp, size, "SELECT AID " _WHITE_("%s"), sprint_hex_inrow(cmd + pos + 4 + 1, n));
+            // iceman:  add a lookup to known SEOS AID's
             return;
         }
 
@@ -1869,6 +2177,55 @@ void annotateSeos(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize, bool is
 
         if (memcmp(cmd + pos, "\x0C\x41\x0C\x03", 4) == 0) {
             snprintf(exp, size, "CREATE ADF");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\x00\xD4\x00\x00\x00", 5) == 0) {
+            snprintf(exp, size, "GET REMAINING CREDITS");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\x10\x00\x00\x00", 5) == 0) {
+            snprintf(exp, size, "GET APPLET INFO");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xD3\x00\x00\x00", 5) == 0) {
+            snprintf(exp, size, "GET APPLET VERSION");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xDA\x04", 3) == 0) {
+            snprintf(exp, size, "PUSH ENGINE ID");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xDA\x05", 3) == 0) {
+            snprintf(exp, size, "PUSH USERNAME");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xDA\x10\x00\x01\x01", 6) == 0) {
+            snprintf(exp, size, "FINAL PERSONALIZE");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xDA\x25\x00\x02\x01", 6) == 0) {
+            snprintf(exp, size, "UNKNOWN OPCODE ( 0x25 )");
+            return;
+        }
+
+        if (memcmp(cmd + pos, "\xA0\xCA\x00\x00\x00", 5) == 0) {
+            snprintf(exp, size, "GET DATA");
+            return ;
+        }
+
+        //	CLA	0x90    Proprietary class - DESFire's "ISO 7816 wrap of native commands" indicator.
+        //  Tells the card "the next byte is a DESFire native opcode, not an ISO 7816 standard INS."
+        //  INS 0x5A    DESFire native opcode SelectApplication (3-byte AID).
+
+        if (memcmp(cmd + pos, "\x90\x5A\x00\x00", 4) == 0) {
+            snprintf(exp, size, "(desfire) SELECT AID " _CYAN_("%02X%02X%02X"), cmd[pos + 5], cmd[pos + 6], cmd[pos + 7]);
             return;
         }
 
@@ -1970,48 +2327,77 @@ void annotateLegic(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
 }
 
 void annotateFelica(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
-    switch (cmd[3]) {
-        case FELICA_POLL_REQ:
+    if (cmdsize < 4) {
+        snprintf(exp, size, "?");
+        return;
+    }
+
+    uint16_t cmd_code = cmd[3];
+    if (cmd_code >= 0xC0 && cmdsize > 4) {
+        // Command codes >= 0xC0 include a second-byte subcommand/function code.
+        cmd_code = (uint16_t)((cmd_code << 8) | cmd[4]);
+    }
+
+    switch (cmd_code) {
+        case FELICA_POLL_REQ: {
+            // Polling request code is byte 6 of the trace frame.
+            if (cmdsize > 6) {
+                if (cmd[6] == 0x01) {
+                    snprintf(exp, size, "POLLING (SYSTEM CODE)");
+                    break;
+                }
+                if (cmd[6] == 0x02) {
+                    snprintf(exp, size, "POLLING (COMMUNICATION PERFORMANCE)");
+                    break;
+                }
+            }
             snprintf(exp, size, "POLLING");
             break;
+        }
         case FELICA_POLL_ACK:
-            snprintf(exp, size, "POLL ACK");
+            snprintf(exp, size, "POLLING ACK");
             break;
         case FELICA_REQSRV_REQ:
             snprintf(exp, size, "REQUEST SERVICE");
             break;
         case FELICA_REQSRV_ACK:
-            snprintf(exp, size, "REQ SERV ACK");
+            snprintf(exp, size, "REQUEST SERVICE ACK");
             break;
         case FELICA_REQRESP_REQ:
             snprintf(exp, size, "REQUEST RESPONSE");
             break;
         case FELICA_REQRESP_ACK:
-            snprintf(exp, size, "REQ RESP ACK");
+            snprintf(exp, size, "REQUEST RESPONSE ACK");
             break;
         case FELICA_RDBLK_REQ:
-            snprintf(exp, size, "READ BLK");
+            snprintf(exp, size, "READ WITHOUT ENCRYPTION");
             break;
         case FELICA_RDBLK_ACK:
-            snprintf(exp, size, "READ BLK ACK");
+            snprintf(exp, size, "READ WITHOUT ENCRYPTION ACK");
             break;
         case FELICA_WRTBLK_REQ:
-            snprintf(exp, size, "WRITE BLK");
+            snprintf(exp, size, "WRITE WITHOUT ENCRYPTION");
             break;
         case FELICA_WRTBLK_ACK:
-            snprintf(exp, size, "WRITE BLK ACK");
+            snprintf(exp, size, "WRITE WITHOUT ENCRYPTION ACK");
             break;
         case FELICA_SRCHSYSCODE_REQ:
             snprintf(exp, size, "SEARCH SERVICE CODE");
             break;
         case FELICA_SRCHSYSCODE_ACK:
-            snprintf(exp, size, "SSC ACK");
+            snprintf(exp, size, "SEARCH SERVICE CODE ACK");
             break;
         case FELICA_REQSYSCODE_REQ:
             snprintf(exp, size, "REQUEST SYSTEM CODE");
             break;
         case FELICA_REQSYSCODE_ACK:
-            snprintf(exp, size, "RSC ACK");
+            snprintf(exp, size, "REQUEST SYSTEM CODE ACK");
+            break;
+        case FELICA_REQBLKINFO_REQ:
+            snprintf(exp, size, "REQUEST BLOCK INFORMATION");
+            break;
+        case FELICA_REQBLKINFO_ACK:
+            snprintf(exp, size, "REQUEST BLOCK INFORMATION ACK");
             break;
         case FELICA_AUTH1_REQ:
             snprintf(exp, size, "AUTH 1");
@@ -2043,11 +2429,53 @@ void annotateFelica(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
         case FELICA_GET_NODE_LIST_ACK:
             snprintf(exp, size, "REQUEST CODE LIST ACK");
             break;
+        case FELICA_REQBLKINFO_EX_REQ:
+            snprintf(exp, size, "REQUEST BLOCK INFORMATION EX");
+            break;
+        case FELICA_REQBLKINFO_EX_ACK:
+            snprintf(exp, size, "REQUEST BLOCK INFORMATION EX ACK");
+            break;
+        case FELICA_SET_PARAMETER_REQ:
+            snprintf(exp, size, "SET PARAMETER");
+            break;
+        case FELICA_SET_PARAMETER_ACK:
+            snprintf(exp, size, "SET PARAMETER ACK");
+            break;
+        case FELICA_GET_CONTAINER_ISSUE_INFO_REQ:
+            snprintf(exp, size, "GET CONTAINER ISSUE INFO");
+            break;
+        case FELICA_GET_CONTAINER_ISSUE_INFO_ACK:
+            snprintf(exp, size, "GET CONTAINER ISSUE INFO ACK");
+            break;
+        case FELICA_GET_AREA_INFO_REQ:
+            snprintf(exp, size, "GET AREA INFO");
+            break;
+        case FELICA_GET_AREA_INFO_ACK:
+            snprintf(exp, size, "GET AREA INFO ACK");
+            break;
+        case FELICA_GET_NODE_PROPERTY_REQ:
+            snprintf(exp, size, "GET NODE PROPERTY");
+            break;
+        case FELICA_GET_NODE_PROPERTY_ACK:
+            snprintf(exp, size, "GET NODE PROPERTY ACK");
+            break;
+        case FELICA_GET_CONTAINER_PROPERTY_REQ:
+            snprintf(exp, size, "GET CONTAINER PROPERTY");
+            break;
+        case FELICA_GET_CONTAINER_PROPERTY_ACK:
+            snprintf(exp, size, "GET CONTAINER PROPERTY ACK");
+            break;
         case FELICA_REQSRV2_REQ:
             snprintf(exp, size, "REQUEST SERVICE v2");
             break;
         case FELICA_REQSRV2_ACK:
-            snprintf(exp, size, "REQ SERV v2 ACK");
+            snprintf(exp, size, "REQUEST SERVICE v2 ACK");
+            break;
+        case FELICA_INTERNAL_AUTH_READ_REQ:
+            snprintf(exp, size, "INTERNAL AUTHENTICATE AND READ");
+            break;
+        case FELICA_INTERNAL_AUTH_READ_ACK:
+            snprintf(exp, size, "INTERNAL AUTHENTICATE AND READ ACK");
             break;
         case FELICA_GETSTATUS_REQ:
             snprintf(exp, size, "GET STATUS");
@@ -2055,11 +2483,17 @@ void annotateFelica(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
         case FELICA_GETSTATUS_ACK:
             snprintf(exp, size, "GET STATUS ACK");
             break;
+        case FELICA_GETPLATFORMINFO_REQ:
+            snprintf(exp, size, "GET PLATFORM INFO");
+            break;
+        case FELICA_GETPLATFORMINFO_ACK:
+            snprintf(exp, size, "GET PLATFORM INFO ACK");
+            break;
         case FELICA_REQUEST_SPEC_VERSION_REQ:
             snprintf(exp, size, "REQUEST SPEC VERSION");
             break;
         case FELICA_REQUEST_SPEC_VERSION_ACK:
-            snprintf(exp, size, "REQUEST SPEC ACK");
+            snprintf(exp, size, "REQUEST SPEC VERSION ACK");
             break;
         case FELICA_RESET_MODE_REQ:
             snprintf(exp, size, "RESET MODE");
@@ -2095,7 +2529,16 @@ void annotateFelica(char *exp, size_t size, uint8_t *cmd, uint8_t cmdsize) {
             snprintf(exp, size, "UPDATE RANDOM ID");
             break;
         case FELICA_UPDATE_RNDID_ACK:
-            snprintf(exp, size, "URI ACK");
+            snprintf(exp, size, "UPDATE RANDOM ID ACK");
+            break;
+        case FELICA_GET_CONTAINER_ID_REQ:
+            snprintf(exp, size, "GET CONTAINER ID");
+            break;
+        case FELICA_GET_CONTAINER_ID_ACK:
+            snprintf(exp, size, "GET CONTAINER ID ACK");
+            break;
+        case FELICA_ECHO_REQ:
+            snprintf(exp, size, "ECHO");
             break;
         default                     :
             snprintf(exp, size, "?");

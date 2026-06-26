@@ -19,7 +19,8 @@
 
 # This Makefile might have been called directly, not via the root Makefile, so:
 ifeq ($(PLTNAME),)
-    -include ../Makefile.platform
+    PLATFORM_FILE ?= ../Makefile.platform
+    -include $(PLATFORM_FILE)
     -include ../.Makefile.options.cache
     include ../common_arm/Makefile.hal
 # detect if there were changes in the platform definitions, requiring a clean
@@ -31,17 +32,16 @@ endif
 #remove one of the following defines and comment out the relevant line
 #in the next section to remove that particular feature from compilation.
 # NO space,TABs after the "\" sign.
-APP_CFLAGS = $(PLATFORM_DEFS) \
-             -ffunction-sections -fdata-sections
+APP_CFLAGS = $(PLATFORM_DEFS)
 
 SRC_LF = lfops.c lfsampling.c pcf7931.c lfdemod.c lfadc.c
 SRC_HF = hfops.c
 SRC_ISO15693 = iso15693.c iso15693tools.c
-SRC_ISO14443a = iso14443a.c mifareutil.c mifarecmd.c epa.c mifaresim.c sam_common.c sam_mfc.c sam_seos.c
+SRC_ISO14443a = iso14443a.c secc.c mifareutil.c mifarecmd.c epa.c mifaresim.c sam_common.c sam_mfc.c sam_seos.c sam_sc.c
 
 #UNUSED: mifaresniff.c
 SRC_ISO14443b = iso14443b.c
-SRC_FELICA = felica.c
+SRC_FELICA = felica.c felicasim.c
 SRC_CRAPTO1 = crypto1.c des.c desfire_crypto.c mifaredesfire.c aes.c platform_util.c
 SRC_CRC = crc.c crc16.c crc32.c
 SRC_ICLASS = iclass.c optimized_cipherutils.c optimized_ikeys.c optimized_elite.c optimized_cipher.c sam_picopass.c
@@ -109,14 +109,13 @@ include Standalone/Makefile.inc
 #the lz4 source files required for decompressing the fpga config at run time
 SRC_LZ4 = lz4.c
 #additional defines required to compile lz4
-LZ4_CFLAGS = -DLZ4_MEMORY_USAGE=8
+LZ4_CFLAGS = -DLZ4_MEMORY_USAGE=8 -DLZ4_HEAPMODE=0
 APP_CFLAGS += $(LZ4_CFLAGS)
 # lz4 includes:
 APP_CFLAGS += -I../common/lz4
 
 # stdint.h provided locally until GCC 4.5 becomes C99 compliant,
-# stack-protect , no-pie reduces size on Gentoo Hardened 8.2 gcc
-APP_CFLAGS += -I. -fno-stack-protector -fno-pie
+APP_CFLAGS += -I.
 
 # Compile these in thumb mode (small size)
 THUMBSRC = start.c \
@@ -214,7 +213,8 @@ $(FPGA_COMPRESSOR):
 
 $(OBJDIR)/fullimage.stage1.elf: $(VERSIONOBJ) $(OBJDIR)/fpga_all.o $(THUMBOBJ) $(ARMOBJ)
 	$(info [=] LD $@)
-	$(Q)$(CROSS_LD) $(CROSS_LDFLAGS) -Wl,-T,ldscript,-Map,$(patsubst %.elf,%.map,$@) -o $@ $^ $(LIBS)
+# Using -T instead of -Wl,-T is needed to prevent the linker from using the default ldscript when using picolibc instead of newlib
+	$(Q)$(CROSS_LD) $(CROSS_LDFLAGS) -T ldscript -Wl,-Map,$(patsubst %.elf,%.map,$@) -o $@ $^ $(LIBS)
 
 $(OBJDIR)/fullimage.data.bin: $(OBJDIR)/fullimage.stage1.elf
 	$(info [-] GEN $@)

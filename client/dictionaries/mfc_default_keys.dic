@@ -32,6 +32,12 @@ D01AFEEB890A
 # 17 B
 4B791BEA7BCC
 #
+# Mifare Plus SE post-1K blocks
+# Key A
+4823741386AB
+# Key B
+326587C3D17F
+#
 # QL88 keys
 # 17 A/B
 2612C6DE84CA
@@ -1496,7 +1502,7 @@ D7744A1A0C44
 82908B57EF4F
 FE04ECFE5577
 #
-# comfort inn hotel
+# MIWA ALVH Hotel Locks, A/B sector keys respectively, ASCII MWALVH and MHALVH
 4D57414C5648
 4D48414C5648
 #

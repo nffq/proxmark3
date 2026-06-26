@@ -26,12 +26,15 @@
 #include "cmdhf14b.h"       // ISO14443-B
 #include "cmdhf15.h"        // ISO15693
 #include "cmdhfaliro.h"     // ALIRO digital keys
+#include "cmdhfcalypso.h"   // Calypso transport cards
 #include "cmdhfcipurse.h"   // CIPURSE transport cards
 #include "cmdhfcryptorf.h"  // CryptoRF
 #include "cmdhfepa.h"       // German Identification Card
 #include "cmdhfemrtd.h"     // eMRTD
 #include "cmdhffelica.h"    // ISO18092 / FeliCa
 #include "cmdhffido.h"      // FIDO authenticators
+#include "cmdhffmcos.h"     // FMCOS CPU cards
+#include "cmdhfsecc.h"      // iClass SE Config Card
 #include "cmdhffudan.h"     // Fudan cards
 #include "cmdhfgallagher.h" // Gallagher DESFire cards
 #include "cmdhfgst.h"       // Google Smart Tap
@@ -42,8 +45,8 @@
 #include "cmdhflegic.h"     // LEGIC
 #include "cmdhflto.h"       // LTO-CM
 #include "cmdhfmf.h"        // CLASSIC
-#include "cmdhfmfu.h"       // ULTRALIGHT/NTAG etc
 #include "cmdhfmfp.h"       // Mifare Plus
+#include "cmdhfmfu.h"       // ULTRALIGHT/NTAG etc
 #include "cmdhfmfdes.h"     // DESFIRE
 #include "cmdhfntag424.h"   // NTAG 424 DNA
 #include "cmdhfsaflok.h"    // Saflok
@@ -579,15 +582,18 @@ static command_t CommandTable[] = {
     {"14b",         CmdHF14B,         AlwaysAvailable, "{ ISO14443B RFIDs...                  }"},
     {"15",          CmdHF15,          AlwaysAvailable, "{ ISO15693 RFIDs...                   }"},
     {"aliro",       CmdHFAliro,       AlwaysAvailable, "{ ALIRO digital access credentials... }"},
+    {"calypso",     CmdHFCalypso,     AlwaysAvailable, "{ Calypso transport cards...          }"},
 //    {"cryptorf",    CmdHFCryptoRF,    AlwaysAvailable, "{ CryptoRF RFIDs...                   }"},
     {"cipurse",     CmdHFCipurse,     AlwaysAvailable, "{ Cipurse transport Cards...          }"},
     {"epa",         CmdHFEPA,         AlwaysAvailable, "{ German Identification Card...       }"},
     {"emrtd",       CmdHFeMRTD,       AlwaysAvailable, "{ Machine Readable Travel Document... }"},
     {"felica",      CmdHFFelica,      AlwaysAvailable, "{ ISO18092 / FeliCa RFIDs...          }"},
     {"fido",        CmdHFFido,        AlwaysAvailable, "{ FIDO and FIDO2 authenticators...    }"},
+    {"fmcos",       CmdHFFmcos,       AlwaysAvailable, "{ FMCOS CPU cards...                  }"},
     {"fudan",       CmdHFFudan,       AlwaysAvailable, "{ Fudan RFIDs...                      }"},
     {"gallagher",   CmdHFGallagher,   AlwaysAvailable, "{ Gallagher DESFire RFIDs...          }"},
     {"gst",         CmdHFGST,         AlwaysAvailable, "{ Google Smart Tap passes...          }"},
+    {"secc",        CmdHFHIDConfig,   AlwaysAvailable, "{ iClass SE Config Card Emulator...   }"},
     {"iclass",      CmdHFiClass,      AlwaysAvailable, "{ ICLASS RFIDs...                     }"},
     {"ict",         CmdHFICT,         AlwaysAvailable, "{ ICT MFC/DESfire RFIDs...            }"},
     {"jooki",       CmdHF_Jooki,      AlwaysAvailable, "{ Jooki RFIDs...                      }"},

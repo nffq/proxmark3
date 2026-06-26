@@ -20,8 +20,44 @@ Each entry in `client/resources/aidlist.json` must contain all of the fields bel
 - `Sources`: Array of strings describing where the AID metadata was sourced from. Supported formats:
   - `android://<package.name>` for Android apps that declare or use this AID.
   - `http://...` or `https://...` for public references used to add or verify the entry.
+- `Protocol`: Application-layer protocol implemented by this AID. Use lowercase `snake_case` (for example `apple_vas`).
+  If the protocol is vendor/ecosystem-specific, include an owner qualifier in the name (for example `google_smart_tap`, `ccc_digital_car_key`) instead of using a generic label.
+  Known protocol names currently used:
+  - `aep_vts`
+  - `apple_access_key`
+  - `apple_home_key`
+  - `apple_vas`
+  - `ccc_digital_car_key`
+  - `cna_calypso`
+  - `csa_aliro`
+  - `google_smart_tap`
+  - `hid_seos`
+  - `ict_protege_mobile`
+  - `kastle_presence`
+  - `ks_x_6924`
+  - `legic_connect`
+  - `mifare_desfire`
+  - `mifare_plus`
+  - `salto_justin_mobile`
+  - `samsung_vas`
+  - `schlage_mobile_access`
+  - `stid_mobile_id`
+  - `suprema_mobile`
+  - `unifi_identity`
+- `Extras`: Object containing protocol-specific attributes for this entry, scoped based on `Protocol`. Use `Extras` only when the attribute applies to this exact AID entry; do not put exact-match metadata on broad prefix or wildcard entries.
 
-Example:
+### Known `Extras` keys
+
+#### `cna_calypso`:
+- `LID`: Calypso Long Identifier as a 4-character uppercase hex string, no spaces or separators. Use this when a Calypso AID/DF Name is known to correspond to a specific MF or DF LID.
+
+#### `mifare_desfire`:
+- `AID`: MIFARE DESFire application identifier as a 6-character uppercase hex string, no spaces or separators. Use the same byte order and notation as `client/resources/aid_desfire.json` when an ISO/IEC 7816 AID entry is known to correspond to a specific DESFire application.
+- `ISOFID`: ISO/IEC 7816 file identifier associated with the DESFire application as a 4-character uppercase hex string, no spaces or separators.
+
+## Examples
+
+Simple entry:
 ```json
 {
     "AID": "A00000039656434103F1216000000000",
@@ -33,7 +69,7 @@ Example:
 }
 ```
 
-Response-disambiguation example:
+Response format disambiguation example:
 ```json
 {
     "AID": "4F53452E5641532E3031",
@@ -42,6 +78,7 @@ Response-disambiguation example:
     "Name": "Google Smart Tap (OSE.VAS.01)",
     "Description": "Google Smart Tap",
     "Type": "loyalty",
+    "Protocol": "google_smart_tap",
     "ResponseRegex": ".*500a416e64726f6964506179.*9000$"
 }
 ```
@@ -59,5 +96,38 @@ Sources example:
         "android://com.lane.lane",
         "https://example.com/reference"
     ]
+}
+```
+
+Extras example:
+```json
+{
+    "AID": "A0000004040125090101",
+    "Vendor": "Ile-de-France Mobilites",
+    "Country": "France",
+    "Name": "Navigo",
+    "Description": "CALYPSO-based Navigo paper ticket application.",
+    "Type": "transport",
+    "Protocol": "cna_calypso",
+    "Extras": {
+        "LID": "2000"
+    }
+}
+```
+
+MIFARE DESFire extras example:
+```json
+{
+    "AID": "A00000039656434103F213F000000000",
+    "Vendor": "ORCA",
+    "Country": "United States",
+    "Name": "ORCA transit card",
+    "Description": "DESFire-based transit card",
+    "Type": "transport",
+    "Protocol": "mifare_desfire",
+    "Extras": {
+        "AID": "F213F0",
+        "ISOFID": "EA00"
+    }
 }
 ```

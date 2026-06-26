@@ -224,7 +224,7 @@ static void generate_command_wrapping(uint8_t *command_Header, int command_heade
     uint8_t padded_encrypted_Command[padded_unencrypted_Command_len];
     create_cryptogram(diversified_enc_key, padded_unencrypted_Command, padded_encrypted_Command, padded_unencrypted_Command_len, encryption_algorithm);
 
-    uint8_t asn1_tag_cryptograph[2] = {0x85, ARRAYLEN(padded_encrypted_Command)};
+    uint8_t asn1_tag_cryptograph[3] = {0x85, 0x81, ARRAYLEN(padded_encrypted_Command)};
     uint8_t asn1_tag_mac[2] = {0x8e, 0x08};
     uint8_t command_trailer[2] = {0x97, 0x00};
 
@@ -361,9 +361,9 @@ static int seos_get_data(uint8_t *rndICC, uint8_t *rndIFD, uint8_t *diversified_
     uint8_t responseCode[2] = {0};
     uint8_t mac[8] = {0};
     size_t cryptogram_length = 0;
-    
+
     // Parse the response to extract the three tags
-    for (int i = 0; i < resplen - 2; ) {
+    for (int i = 0; i < resplen - 2;) {
         if (response[i] == 0x85) {
             // Cryptogram tag
             size_t offset = i + 1;
@@ -384,7 +384,7 @@ static int seos_get_data(uint8_t *rndICC, uint8_t *rndIFD, uint8_t *diversified_
             i += 2 + response[i + 1];
         }
     }
-    
+
     // ------------------- Cryptogram Response -------------------
     if (cryptogram_length > 0) {
         uint8_t decrypted[cryptogram_length];
@@ -392,15 +392,15 @@ static int seos_get_data(uint8_t *rndICC, uint8_t *rndIFD, uint8_t *diversified_
 
         // Decrypt the response
         decrypt_cryptogram(diversified_enc_key, cryptogram, decrypted, cryptogram_length, encryption_algorithm);
-        
+
         //PrintAndLogEx(SUCCESS, "Cryptogram....................... " _YELLOW_("%s"), sprint_hex_inrow(cryptogram, cryptogram_length));
         //PrintAndLogEx(SUCCESS, "Decrypted........................ " _YELLOW_("%s"), sprint_hex_inrow(decrypted, cryptogram_length));
-        
+
         // Parse TLV: tag can be 1 or 2 bytes
         int offset = 0;
         uint8_t tag[2] = {0x00, 0x00};
         int tag_len = 1;
-        
+
         // Check if it's a 2-byte tag (first byte has bits 5-1 all set to 1)
         if ((decrypted[offset] & 0x1F) == 0x1F) {
             tag[0] = decrypted[offset];
@@ -411,28 +411,28 @@ static int seos_get_data(uint8_t *rndICC, uint8_t *rndIFD, uint8_t *diversified_
             tag[0] = decrypted[offset];
             offset += 1;
         }
-        
+
         // Get length byte
         uint8_t length_byte = decrypted[offset];
         offset += 1;
-        
+
         // Extract the value
         getDataSize = length_byte;
         memcpy(sioOutput, decrypted + offset, getDataSize);
         *sio_size = getDataSize;
-        
+
         PrintAndLogEx(SUCCESS, "Tag.............................. " _YELLOW_("%s"), sprint_hex_inrow(tag, tag_len));
         PrintAndLogEx(SUCCESS, "Value............................ " _YELLOW_("%s"), sprint_hex_inrow(sioOutput, getDataSize));
     }
-    
+
     if (responseCode[0] != 0x00 || responseCode[1] != 0x00) {
         PrintAndLogEx(SUCCESS, "Response Code.................... " _YELLOW_("%s"), sprint_hex_inrow(responseCode, ARRAYLEN(responseCode)));
     }
-    
+
     // if (mac[0] != 0x00) {
     //     PrintAndLogEx(SUCCESS, "MAC.............................. " _YELLOW_("%s"), sprint_hex_inrow(mac, sizeof(mac)));
     // }
-    
+
     return PM3_SUCCESS;
 };
 
@@ -874,9 +874,9 @@ static int select_df_decode(uint8_t *response, uint8_t response_length, int *ALG
     }
 
     if (plaintext_adf == false) {
-    if (plaintext_adf == false) {
-        PrintAndLogEx(SUCCESS, "CRYPTOGRAM Encrypted Data........ " _YELLOW_("%s"), sprint_hex_inrow(CRYPTOGRAM_encrypted_data, 64));
-    }
+        if (plaintext_adf == false) {
+            PrintAndLogEx(SUCCESS, "CRYPTOGRAM Encrypted Data........ " _YELLOW_("%s"), sprint_hex_inrow(CRYPTOGRAM_encrypted_data, 64));
+        }
     }
     // PrintAndLogEx(SUCCESS, "MAC.............................. " _YELLOW_("%s"), sprint_hex_inrow(MAC_value, 8));
 
@@ -962,9 +962,16 @@ static int select_ADF_decrypt(const char *selectADFOID, uint8_t *CRYPTOGRAM_encr
 
     // Skip synthesized IV
     for (int i = iv_size * 2; i < CRYPTOGRAM_decrypted_data_length; i++) {
+
         // ADF OID tag
         if (CRYPTOGRAM_decrypted_data[i] == 0x06 && CRYPTOGRAM_decrypted_data[i + 1] <= MAX_OID_LEN) {
+
             adf_length = ((CRYPTOGRAM_decrypted_data[i + 1]));
+            if (adf_length > 64) {
+                PrintAndLogEx(ERR, "adf length too large, have 64, ( got %u )", adf_length);
+                return PM3_ESOFT;
+            }
+
             diversifier_length = CRYPTOGRAM_decrypted_data[i + adf_length + 3];
             if (*diversifier_length_out < diversifier_length) {
                 PrintAndLogEx(ERR, "Diversifier too long");
@@ -1837,6 +1844,7 @@ static int CmdHfSeosWrite(const char *Cmd) {
 
     void *argtable[] = {
         arg_param_begin,
+        arg_str0("t", "tag", "<hex>", "<0-100> hex bytes for tag to read (Default: FF00)"),
         arg_str0("o", "oid", "<hex>", "<0-100> hex bytes for OID (Default: 2B0601040181E438010102011801010202)"),
         arg_str0(NULL, "privacy-key", "<idx>", "Privacy key slot index. The selected slot provides both privacy encryption and MAC subkeys and is sent as the privacy slot identifier"),
         arg_str0(NULL, "auth-key", "<idx>", "Auth key slot index. The selected slot provides the auth key and is sent as the auth slot identifier"),
@@ -1846,12 +1854,13 @@ static int CmdHfSeosWrite(const char *Cmd) {
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    int data_tag_len = 2;
-    uint8_t data_tag[2] = {0xff, 0x00};
+    int data_tag_len = 0;
+    uint8_t data_tag[16] = {0xff, 0x00};
+    CLIGetHexWithReturn(ctx, 1, data_tag, &data_tag_len);
 
     int oid_len = 0;
     uint8_t oid_hex[256] = {0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x02, 0x01, 0x18, 0x01, 0x01, 0x02, 0x02};
-    CLIGetHexWithReturn(ctx, 1, oid_hex, &oid_len);
+    CLIGetHexWithReturn(ctx, 2, oid_hex, &oid_len);
 
     int privacy_key_index = 2;
     int auth_key_index = 2;
@@ -1861,8 +1870,8 @@ static int CmdHfSeosWrite(const char *Cmd) {
     int aid_len = 0;
     char privacy_key_str[12] = {0};
     char auth_key_str[12] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)privacy_key_str, sizeof(privacy_key_str), &privacy_key_len);
-    CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)auth_key_str, sizeof(auth_key_str), &auth_key_len);
+    CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)privacy_key_str, sizeof(privacy_key_str), &privacy_key_len);
+    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)auth_key_str, sizeof(auth_key_str), &auth_key_len);
     if (privacy_key_len != 0 && seos_parse_key_index(privacy_key_str, &privacy_key_index) == false) {
         CLIParserFree(ctx);
         PrintAndLogEx(ERR, "Invalid privacy key. Expected --privacy-key N with index in range 0-%zu", ARRAYLEN(keys) - 1);
@@ -1873,11 +1882,11 @@ static int CmdHfSeosWrite(const char *Cmd) {
         PrintAndLogEx(ERR, "Invalid auth key. Expected --auth-key N with index in range 0-%zu", ARRAYLEN(keys) - 1);
         return PM3_EINVARG;
     }
-    int res = seos_get_custom_aid(ctx, 4, aid, &aid_len);
+    int res = seos_get_custom_aid(ctx, 5, aid, &aid_len);
 
     int data_len = 0;
     uint8_t data[256] = {};
-    CLIGetHexWithReturn(ctx, 5, data, &data_len);
+    CLIGetHexWithReturn(ctx, 6, data, &data_len);
 
     CLIParserFree(ctx);
     if (res != PM3_SUCCESS) {
@@ -2010,9 +2019,9 @@ static int CmdHfSeosSim(const char *Cmd) {
                   "  - Encryption : AES128\n"
                   "  - Hashing    : SHA256\n",
                   "hf seos sim -d 12345678\n"
-                  "hf seos sim --privacy-key 8 --auth-key 9 -d 12345678\n"
-                  "hf seos sim -o 2B0601040181E438010102011801010202 -u 01020304050607 --privacy-key 8 --auth-key 9 -d 12345678\n"
-                  "hf seos sim -o 2B0601040181E438010102011801010202 --legacy -t FF41 -d 12345678\n"
+                  "hf seos sim --privacy-key 8 --auth-key 9 -d 03020500\n"
+                  "hf seos sim -o 2B0601040181E438010102011801010202 --div 01020304050607 --privacy-key 8 --auth-key 9 -d 03020500\n"
+                  "hf seos sim -o 2B0601040181E438010102011801010202 --legacy -t FF41 -d 03020500\n"
                  );
 
     void *argtable[] = {
@@ -2120,7 +2129,7 @@ static int CmdHfSeosSim(const char *Cmd) {
 
     PacketResponseNG resp;
     clearCommandBuffer();
-    SendCommandNG(CMD_HF_SEOS_SIMULATE, (uint8_t*)&request, sizeof(request));
+    SendCommandNG(CMD_HF_SEOS_SIMULATE, (uint8_t *)&request, sizeof(request));
 
     PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("<Enter>") " to abort simulation");
     while (WaitForResponseTimeout(CMD_HF_SEOS_SIMULATE, &resp, 1000) == false) {
@@ -2217,14 +2226,16 @@ static int CmdHfSeosManageKeys(const char *Cmd) {
     }
 
     if (do_update) {
-        if (privacy_len != 0) {
+
+        if (privacy_len) {
             memcpy(keys[key_index].privEncKey, privacy, 16);
             memcpy(keys[key_index].privMacKey, privacy + 16, 16);
-            PrintAndLogEx(SUCCESS, "New value for Privacy Key[%d] " _GREEN_("%s"), key_index, sprint_hex_inrow(privacy, 32));
+            PrintAndLogEx(SUCCESS, "New Privacy Key[%d] " _GREEN_("%s"), key_index, sprint_hex_inrow(privacy, sizeof(privacy)));
         }
-        if (auth_len != 0) {
+
+        if (auth_len) {
             memcpy(keys[key_index].authKey, auth, 16);
-            PrintAndLogEx(SUCCESS, "New value for Auth Key[%d] " _GREEN_("%s"), key_index, sprint_hex_inrow(keys[key_index].authKey, 16));
+            PrintAndLogEx(SUCCESS, "New Auth Key[%d] " _GREEN_("%s"), key_index, sprint_hex_inrow(keys[key_index].authKey, 16));
         }
         return PM3_SUCCESS;
     }

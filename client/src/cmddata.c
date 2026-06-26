@@ -866,6 +866,10 @@ int AutoCorrelate(const int *in, int *out, size_t len, size_t window, bool SaveG
     double variance = compute_variance(in, len);
 
     int *correl_buf = calloc(MAX_GRAPH_TRACE_LEN, sizeof(int));
+    if (correl_buf == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return -1;
+    }
 
     uint8_t peak_cnt = 0;
     size_t peaks[10] = {0};
@@ -3053,9 +3057,9 @@ static int CmdDiff(const char *Cmd) {
     memset(hdr1 + strlen(hdr1), '-', hdr_sln);
 
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, hdr1);
-    PrintAndLogEx(INFO, hdr0);
-    PrintAndLogEx(INFO, hdr1);
+    PrintAndLogEx(INFO, "%s", hdr1);
+    PrintAndLogEx(INFO, "%s", hdr0);
+    PrintAndLogEx(INFO, "%s", hdr1);
 
     char line[880] = {0};
 
@@ -3127,7 +3131,7 @@ static int CmdDiff(const char *Cmd) {
     }
 
     // footer
-    PrintAndLogEx(INFO, hdr1);
+    PrintAndLogEx(INFO, "%s", hdr1);
     PrintAndLogEx(NORMAL, "");
 
     free(inB);

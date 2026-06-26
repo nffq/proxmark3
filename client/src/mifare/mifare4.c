@@ -21,6 +21,7 @@
 #include "commonutil.h"  // ARRAYLEN
 #include "comms.h" // DropField
 #include "cmdhf14a.h"
+#include "cmdhfmfp.h" // mfp_data_crypt
 #include "ui.h"
 #include "crypto/libpcrypto.h"
 
@@ -203,23 +204,29 @@ int CalculateMAC(mf4Session_t *mf4session, MACType_t mtype, uint8_t blockNum, ui
     return aes_cmac8(NULL, mf4session->Kmac, macdata, mac, macdatalen);
 }
 
-int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, bool activateField, bool leaveSignalON, bool dropFieldIfError, bool verbose, bool silentMode) {
+int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, bool nonfirst, bool activateField, bool leaveSignalON, bool dropFieldIfError, bool verbose, bool silentMode) {
     uint8_t data[257] = {0};
     int datalen = 0;
-
-    uint8_t RndA[17] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x00};
+    if (nonfirst && memcmp(mf4session->Kmac, data, 16) == 0) { // compiler abuse
+        PrintAndLogEx(WARNING, "Function invocation error: cannot do non-first authentication yet");
+        PrintAndLogEx(HINT, "Try to do first authentication");
+        return PM3_EINVARG;
+    } // While TI maybe could be rolled as a zero, MACing key absolutely won't be. Don't tell me it'll happen, it won't, the chances are effectively zero.
+    uint8_t RndA[17] = {0x50, 0x4D, 0x33, 0x20, 0x52, 0x52, 0x47, 0x20, 0x32, 0x30, 0x32, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00};
     uint8_t RndB[17] = {0};
 
     if (silentMode) {
         verbose = false;
     }
 
-    if (mf4session) {
+    if (mf4session && !nonfirst) {
         mf4session->Authenticated = false;
     }
 
-    uint8_t cmd1[] = {0x70, keyn[1], keyn[0], 0x00};
-    int res = ExchangeRAW14a(cmd1, sizeof(cmd1), activateField, true, data, sizeof(data), &datalen, silentMode);
+    uint8_t cmd1[4];
+    if (nonfirst) { cmd1[0] = 0x76; cmd1[1] = keyn[1]; cmd1[2] = keyn[0]; }
+    else { cmd1[0] = 0x70; cmd1[1] = keyn[1]; cmd1[2] = keyn[0]; cmd1[3] = 0x00; }
+    int res = ExchangeRAW14a(cmd1, nonfirst ? 3 : 4, activateField, true, data, sizeof(data), &datalen, silentMode);
     if (res != PM3_SUCCESS) {
 
         if (silentMode == false) {
@@ -233,6 +240,7 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
     }
 
     if (verbose) {
+        PrintAndLogEx(INFO, ">phase1: %s", sprint_hex(cmd1, nonfirst ? 3 : 4));
         PrintAndLogEx(INFO, "< phase1: %s", sprint_hex(data, datalen));
     }
 
@@ -258,7 +266,7 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
         return PM3_EWRONGANSWER;
     }
 
-    if (datalen != 19) { // code 1b + 16b + crc 2b
+    if (datalen != 19) { // code 1b + Rnd 16b + crc 2b
         if (silentMode == false) {
             PrintAndLogEx(ERR, "Card response must be 19 bytes long instead of: %d", datalen);
         }
@@ -269,22 +277,65 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
         return PM3_EWRONGANSWER;
     }
 
-    aes_decode(NULL, key, &data[1], RndB, 16);
-    RndB[16] = RndB[0];
-    if (verbose) {
-        PrintAndLogEx(INFO, "RndB: %s", sprint_hex(RndB, 16));
-    }
-
     uint8_t cmd2[33] = {0};
     cmd2[0] = 0x72;
 
     uint8_t raw[32] = {0};
-    memmove(raw, RndA, 16);
-    memmove(&raw[16], &RndB[1], 16);
+    uint8_t IVR[16];
+    uint8_t IVW[16];
+    // Non-first auth applies all the wild sorcery from the encryption magic (replies have "read IVs", commands must have "write IVs").
+    // To save instructions I'm going to just do one big if check
+    if (nonfirst) {
+        // WARNING TO IMPLEMENTERS
+        // This code is in theory NOT accurate to the confidential datasheet for Mifare Plus.
+        // Refer to proper IV generation in commit f29c94954f0d4958ba7947d11a44f61c900d4168.
+        memcpy(&IVR[0], &mf4session->R_Ctr, 2);
+        memcpy(&IVR[2], &mf4session->W_Ctr, 2);
+        memcpy(&IVR[4], &mf4session->R_Ctr, 2);
+        memcpy(&IVR[6], &mf4session->W_Ctr, 2);
+        memcpy(&IVR[8], &mf4session->R_Ctr, 2);
+        memcpy(&IVR[10], &mf4session->W_Ctr, 2);
+        memcpy(&IVR[12], &mf4session->R_Ctr, 2);
+        memcpy(&IVR[14], &mf4session->W_Ctr, 2);
+        memcpy(&IVR[12], mf4session->TI, 4);
 
-    aes_encode(NULL, key, raw, &cmd2[1], 32);
-    if (verbose) {
-        PrintAndLogEx(INFO, ">phase2: %s", sprint_hex(cmd2, 33));
+        memcpy(&IVW[0], &mf4session->R_Ctr, 2);
+        memcpy(&IVW[2], &mf4session->W_Ctr, 2);
+        memcpy(&IVW[4], &mf4session->R_Ctr, 2);
+        memcpy(&IVW[6], &mf4session->W_Ctr, 2);
+        memcpy(&IVW[8], &mf4session->R_Ctr, 2);
+        memcpy(&IVW[10], &mf4session->W_Ctr, 2);
+        memcpy(&IVW[12], &mf4session->R_Ctr, 2);
+        memcpy(&IVW[14], &mf4session->W_Ctr, 2);
+        memcpy(IVW, mf4session->TI, 4);
+
+        aes_decode(IVR, key, &data[1], RndB, 16);
+        RndB[16] = RndB[0];
+        if (verbose) {
+            PrintAndLogEx(INFO, "RndB: %s", sprint_hex(RndB, 16));
+        }
+
+        memmove(raw, RndA, 16);
+        memmove(&raw[16], &RndB[1], 16);
+
+        aes_encode(IVW, key, raw, &cmd2[1], 32);
+        if (verbose) {
+            PrintAndLogEx(INFO, ">phase2: %s", sprint_hex(cmd2, 33));
+        }
+    } else {
+        aes_decode(NULL, key, &data[1], RndB, 16);
+        RndB[16] = RndB[0];
+        if (verbose) {
+            PrintAndLogEx(INFO, "RndB: %s", sprint_hex(RndB, 16));
+        }
+
+        memmove(raw, RndA, 16);
+        memmove(&raw[16], &RndB[1], 16);
+
+        aes_encode(NULL, key, raw, &cmd2[1], 32);
+        if (verbose) {
+            PrintAndLogEx(INFO, ">phase2: %s", sprint_hex(cmd2, 33));
+        }
     }
 
     res = ExchangeRAW14a(cmd2, sizeof(cmd2), false, true, data, sizeof(data), &datalen, silentMode);
@@ -303,21 +354,9 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
         PrintAndLogEx(INFO, "< phase2: %s", sprint_hex(data, datalen));
     }
 
-    aes_decode(NULL, key, &data[1], raw, 32);
-
-    if (verbose) {
-        PrintAndLogEx(INFO, "res: %s", sprint_hex(raw, 32));
-        PrintAndLogEx(INFO, "RndA`: %s", sprint_hex(&raw[4], 16));
-    }
-
-    if (memcmp(&raw[4], &RndA[1], 16)) {
+    if (data[0] != 0x90) {
         if (silentMode == false) {
-            PrintAndLogEx(ERR, "\nAuthentication FAILED. rnd is not equal");
-        }
-
-        if (verbose) {
-            PrintAndLogEx(ERR, "RndA reader: %s", sprint_hex(&RndA[1], 16));
-            PrintAndLogEx(ERR, "RndA   card: %s", sprint_hex(&raw[4], 16));
+            PrintAndLogEx(ERR, "\nAuthentication FAILED. Card did not ACK response");
         }
 
         if (dropFieldIfError) {
@@ -326,7 +365,20 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
         return PM3_EWRONGANSWER;
     }
 
+    if (nonfirst) { aes_decode(IVR, key, &data[1], raw, 16); }
+    else { aes_decode(NULL, key, &data[1], raw, 32); }
+
     if (verbose) {
+        if (nonfirst) {
+            PrintAndLogEx(INFO, "res: %s", sprint_hex(raw, 16));
+            PrintAndLogEx(INFO, "RndA`: %s", sprint_hex(&raw[0], 16));
+        } else {
+            PrintAndLogEx(INFO, "res: %s", sprint_hex(raw, 32));
+            PrintAndLogEx(INFO, "RndA`: %s", sprint_hex(&raw[4], 16));
+        }
+    }
+
+    if (verbose && !nonfirst) {
         PrintAndLogEx(INFO, " TI: %s", sprint_hex(raw, 4));
         PrintAndLogEx(INFO, "pic: %s", sprint_hex(&raw[20], 6));
         PrintAndLogEx(INFO, "pcd: %s", sprint_hex(&raw[26], 6));
@@ -370,17 +422,19 @@ int MifareAuth4(mf4Session_t *mf4session, const uint8_t *keyn, uint8_t *key, boo
 
     if (mf4session) {
         mf4session->Authenticated = true;
-        mf4session->R_Ctr = 0;
-        mf4session->W_Ctr = 0;
         mf4session->KeyNum = keyn[1] + (keyn[0] << 8);
         memmove(mf4session->RndA, RndA, 16);
         memmove(mf4session->RndB, RndB, 16);
         memmove(mf4session->Key, key, 16);
-        memmove(mf4session->TI, raw, 4);
-        memmove(mf4session->PICCap2, &raw[20], 6);
-        memmove(mf4session->PCDCap2, &raw[26], 6);
         memmove(mf4session->Kenc, kenc, 16);
         memmove(mf4session->Kmac, kmac, 16);
+        if (!nonfirst) {
+            mf4session->R_Ctr = 0;
+            mf4session->W_Ctr = 0;
+            memmove(mf4session->TI, raw, 4);
+            memmove(mf4session->PICCap2, &raw[20], 6);
+            memmove(mf4session->PCDCap2, &raw[26], 6);
+        }
     }
 
     if (verbose) {
@@ -504,7 +558,7 @@ int mfpReadSector(uint8_t sectorNo, uint8_t keyType, uint8_t *key, uint8_t *data
     }
 
     mf4Session_t _session;
-    int res = MifareAuth4(&_session, keyn, key, true, true, true, verbose, false);
+    int res = MifareAuth4(&_session, keyn, key, false, true, true, true, verbose, false);
     if (res) {
         PrintAndLogEx(ERR, "Sector %u authentication error: %d", sectorNo, res);
         return res;
@@ -533,6 +587,9 @@ int mfpReadSector(uint8_t sectorNo, uint8_t keyType, uint8_t *key, uint8_t *data
             return 6;
         }
 
+        // Encrypted mode is always used. Doing an if to check will waste instructions
+        mfp_data_crypt(&_session, &data[1], &data[1], true, 1);
+
         memcpy(&dataout[(n - firstBlockNo) * 16], &data[1], 16);
 
         if (verbose)
@@ -554,6 +611,59 @@ int mfpReadSector(uint8_t sectorNo, uint8_t keyType, uint8_t *key, uint8_t *data
     }
     DropField();
 
+    return PM3_SUCCESS;
+}
+
+int mfpWriteSector(uint8_t sectorNo, uint8_t keyType, uint8_t *key, const uint8_t *datain, bool verbose) {
+    uint8_t keyn[2] = {0};
+
+    uint16_t uKeyNum = 0x4000 + sectorNo * 2 + (keyType ? 1 : 0);
+    keyn[0] = uKeyNum >> 8;
+    keyn[1] = uKeyNum & 0xff;
+    if (verbose) {
+        PrintAndLogEx(INFO, "--sector[%u]:%02x key:%04x", mfNumBlocksPerSector(sectorNo), sectorNo, uKeyNum);
+    }
+
+    mf4Session_t _session;
+    int res = MifareAuth4(&_session, keyn, key, false, true, true, true, verbose, false);
+    if (res) {
+        PrintAndLogEx(ERR, "Sector %u authentication error: %d", sectorNo, res);
+        return res;
+    }
+
+    uint8_t firstBlockNo = mfFirstBlockOfSector(sectorNo);
+    uint8_t numDataBlocks = mfNumBlocksPerSector(sectorNo) - 1;
+
+    for (int n = 0; n < numDataBlocks; n++) {
+        uint8_t blockNo = firstBlockNo + n;
+
+        uint8_t block[16];
+        memcpy(block, datain + (n * 16), 16);
+        mfp_data_crypt(&_session, block, block, false, 1);
+
+        uint8_t data[250] = {0};
+        int datalen = 0;
+        uint8_t mac[8] = {0};
+        res = MFPWriteBlock(&_session, false, false, blockNo & 0xff, 0x00, block,
+                            false, true, data, sizeof(data), &datalen, mac);
+        if (res) {
+            PrintAndLogEx(ERR, "Sector %u block %d write error: %d", sectorNo, blockNo, res);
+            DropField();
+            return res;
+        }
+
+        if (datalen && data[0] != 0x90) {
+            PrintAndLogEx(ERR, "Sector %u block %d card write error: %02x %s",
+                          sectorNo, blockNo, data[0], mfpGetErrorDescription(data[0]));
+            DropField();
+            return PM3_ESOFT;
+        }
+
+        if (verbose)
+            PrintAndLogEx(INFO, "wrote block %d: %s", blockNo, sprint_hex(datain + (n * 16), 16));
+    }
+
+    DropField();
     return PM3_SUCCESS;
 }
 

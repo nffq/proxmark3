@@ -256,7 +256,7 @@ void ProxGuiQT::MainLoop() {
     connect(this, SIGNAL(HidePictureWindowSignal()), this, SLOT(_HidePictureWindow()));
 
     //start proxmark thread after starting event loop
-    QTimer::singleShot(200, this, SLOT(_StartProxmarkThread()));
+    QTimer::singleShot(0, this, SLOT(_StartProxmarkThread()));
 
 #if defined(__MACH__) && defined(__APPLE__)
     //Prevent the terminal from loosing focus during launch by making the client unfocusable
@@ -843,6 +843,7 @@ void Plot::drawAnnotations(QRect annotationRect, QPainter *painter) {
 
         char *textA = (char *)calloc(1, length);
         if (textA == NULL) {
+            free(annotation);
             return;
         }
 

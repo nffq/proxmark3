@@ -33,6 +33,8 @@
 #include "des.h"
 #include "loclass/cipherutils.h"
 #include "loclass/cipher.h"
+#include "loclass/cipher_bs.h"
+#include "loclass/cipher_bs_dispatch.h"
 #include "loclass/ikeys.h"
 #include "loclass/elite_crack.h"
 #include "fileutils.h"
@@ -44,6 +46,7 @@
 #include "proxendian.h"
 #include "iclass_cmd.h"
 #include "crypto/asn1utils.h"       // ASN1 decoder
+#include "crypto/libpcrypto.h"      // aes_encode, aes_decode (for SAM SC)
 #include "preferences.h"
 #include "generator.h"
 #include "cmdhw.h"
@@ -137,6 +140,22 @@ typedef enum {
     TRIPLEDES
 } BLOCK79ENCRYPTION;
 
+static void iclass_set_transport_mode(uint8_t *data, BLOCK79ENCRYPTION mode);
+static int iclass_apply_transport_mode_to_block(uint8_t *blk_data, const uint8_t *key, BLOCK79ENCRYPTION mode, bool encrypt);
+
+static const CLIParserOption IClassEncodeEncryptionOpts[] = {
+    {None, "none"},
+    {DES, "des"},
+    {TRIPLEDES, "2k3des"},
+    {0, NULL},
+};
+
+static const CLIParserOption IClassTransportEncryptionOpts[] = {
+    {DES, "des"},
+    {TRIPLEDES, "2k3des"},
+    {0, NULL},
+};
+
 // 16 bytes key
 static int iclass_load_transport(uint8_t *key, uint8_t n) {
     size_t keylen = 0;
@@ -166,39 +185,98 @@ static int iclass_load_transport(uint8_t *key, uint8_t n) {
 
 static void iclass_decrypt_transport(uint8_t *key, uint8_t limit, uint8_t *enc_data, uint8_t *dec_data,  BLOCK79ENCRYPTION aa1_encryption) {
 
-    // tripledes
-    mbedtls_des3_context ctx;
-    mbedtls_des3_set2key_dec(&ctx, key);
+    bool should_decrypt = false;
+    switch (aa1_encryption) {
+        case DES:
+        case TRIPLEDES:
+            should_decrypt = true;
+            break;
+        case RFU:
+        case None:
+        default:
+            break;
+    }
 
     bool decrypted_block789 = false;
     for (uint8_t i = 0; i < limit; ++i) {
 
         uint16_t idx = i * PICOPASS_BLOCK_SIZE;
-
-        switch (aa1_encryption) {
-            // Right now, only 3DES is supported
-            case TRIPLEDES:
-                // Decrypt block 7,8,9 if configured.
-                if (i > 6 && i <= 9 && memcmp(enc_data + idx, empty, PICOPASS_BLOCK_SIZE) != 0) {
-                    mbedtls_des3_crypt_ecb(&ctx, enc_data + idx, dec_data + idx);
-                    decrypted_block789 = true;
-                }
-                break;
-            case DES:
-            case RFU:
-            case None:
-            // Nothing to do for None anyway...
-            default:
-                continue;
+        if (should_decrypt == false || i <= 6 || i > 9) {
+            continue;
         }
+
+        if (memcmp(enc_data + idx, empty, PICOPASS_BLOCK_SIZE) == 0 || memcmp(enc_data + idx, zeros, PICOPASS_BLOCK_SIZE) == 0) {
+            continue;
+        }
+
+        memcpy(dec_data + idx, enc_data + idx, PICOPASS_BLOCK_SIZE);
+        if (iclass_apply_transport_mode_to_block(dec_data + idx, key, aa1_encryption, false) != PM3_SUCCESS) {
+            break;
+        }
+        decrypted_block789 = true;
 
         if (decrypted_block789) {
             // Set the 2 last bits of block6 to 0 to mark the data as decrypted
             dec_data[(6 * PICOPASS_BLOCK_SIZE) + 7] &= 0xFC;
         }
     }
+}
 
+static void iclass_set_transport_mode(uint8_t *data, BLOCK79ENCRYPTION mode) {
+    data[7] &= 0xFC;
+    data[7] |= (mode & 0x03);
+}
+
+static void iclass_des_block_transform(uint8_t *blk_data, const uint8_t *key, bool encrypt) {
+    mbedtls_des_context ctx;
+    if (encrypt) {
+        mbedtls_des_setkey_enc(&ctx, key);
+    } else {
+        mbedtls_des_setkey_dec(&ctx, key);
+    }
+    mbedtls_des_crypt_ecb(&ctx, blk_data, blk_data);
+    mbedtls_des_free(&ctx);
+}
+
+static void iclass_2k3des_block_transform(uint8_t *blk_data, const uint8_t *key, bool encrypt) {
+    mbedtls_des3_context ctx;
+    if (encrypt) {
+        mbedtls_des3_set2key_enc(&ctx, key);
+    } else {
+        mbedtls_des3_set2key_dec(&ctx, key);
+    }
+    mbedtls_des3_crypt_ecb(&ctx, blk_data, blk_data);
     mbedtls_des3_free(&ctx);
+}
+
+static int iclass_apply_transport_mode_to_block(uint8_t *blk_data, const uint8_t *key, BLOCK79ENCRYPTION mode, bool encrypt) {
+    if (blk_data == NULL) {
+        return PM3_EINVARG;
+    }
+
+    switch (mode) {
+        case None:
+        case RFU:
+            return PM3_SUCCESS;
+        case DES:
+            iclass_des_block_transform(blk_data, key, encrypt);
+            return PM3_SUCCESS;
+        case TRIPLEDES:
+            iclass_2k3des_block_transform(blk_data, key, encrypt);
+            return PM3_SUCCESS;
+        default:
+            return PM3_EINVARG;
+    }
+}
+
+static int iclass_apply_transport_mode_to_credential(uint8_t *credential, const uint8_t *key, BLOCK79ENCRYPTION mode, bool encrypt) {
+    for (uint8_t blockno = 0; blockno < 3; blockno++) {
+        int res = iclass_apply_transport_mode_to_block(credential + (blockno * PICOPASS_BLOCK_SIZE), key, mode, encrypt);
+        if (res != PM3_SUCCESS) {
+            return res;
+        }
+    }
+    return PM3_SUCCESS;
 }
 
 static inline uint32_t leadingzeros(uint64_t a) {
@@ -279,8 +357,8 @@ static uint8_t card_app2_limit[] = {
     0xff,
 };
 
-static iclass_config_card_item_t iclass_config_options[33] =  {
-    //Byte A8 - LED Operations
+static iclass_config_card_item_t iclass_config_options[] =  {
+    // Byte A8 - LED Operations
     {"(LED) - Led idle (Off) / Led read (Off)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(LED) - Led idle (Red) / Led read (Off)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(LED) - Led idle (Grn) / Led read (Off)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
@@ -297,43 +375,44 @@ static iclass_config_card_item_t iclass_config_options[33] =  {
     {"(LED) - Led idle (Red) / Led read (Amber)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(LED) - Led idle (Grn) / Led read (Amber)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(LED) - Led idle (Amber) / Led read (Amber)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA8, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-    //Byte A9 - Potentially associated with led blinking / led heartbeat operations?
-    //Byte A6 - Potentially associated with beep pitch?
-    //Byte A7 - BEEP Operations
+    // Byte A9 - Potentially associated with led blinking / led heartbeat operations?
+    // Byte A6 - Potentially associated with beep pitch?
+    // Byte A7 - BEEP Operations
     {"(BEEP) - Beep on Read (On)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA7, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(BEEP) - Beep on Read (Off)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xA7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-    //Byte AC - MIFARE CSN Operations
+    // Byte AC - MIFARE CSN Operations
     {"(MIFARE) - CSN Default Output", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(MIFARE) - CSN 32 bit Reverse Output", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(MIFARE) - CSN 16 bit Output", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAC, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(MIFARE) - CSN 34 bit Output", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAC, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-    //Bytes AD, AE, AF, B3 - Keypad Operations + not fully mapped
+    // Bytes AD, AE, AF, B3 - Keypad Operations + not fully mapped
     {"(KEYPAD Output) - Buffer ONE key (8 bit Dorado)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAE, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(KEYPAD Output) - Buffer ONE to FIVE keys (standard 26 bit)", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAE, 0x0B, 0xAF, 0xFF, 0xAD, 0x15, 0xB3, 0x03}},
     {"(KEYPAD Output) - Local PIN verify", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x18, 0xAD, 0x6D, 0xB3, 0x03, 0x00, 0x00, 0x00, 0x00}},
-    //iClass Elite Key Operations
+    // iClass Elite Key Operations
     {"(ELITE Key) - Set ELITE Key and Enable Dual key (Elite + Standard)", {0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBF, 0x18, 0xBF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
     {"(ELITE Key) - Set ELITE Key and ENABLE Keyrolling", {0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBF, 0x18, 0xBF, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
     {"(ELITE Key) - Set ELITE Key and DISABLE Standard Key", {0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBF, 0x18, 0xBF, 0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
-    //Erroneous / incorrect reader behaviors (read below)
-    //Elite Bugger:
-    //Sets block 3 of card 0 presented to the reader to 0, sets block 3 of card 1 presented to the reader to the original value of card 0's block 3
-    //Continues setting block 3 of presented cards to block 3 of the previous card the reader scanned
-    //This renders cards unreadable and hardly recoverable unless the order of the scanned cards is known.
+    // Erroneous / incorrect reader behaviors (read below)
+    // Elite Bugger:
+    // Sets block 3 of card 0 presented to the reader to 0, sets block 3 of card 1 presented to the reader to the original value of card 0's block 3
+    // Continues setting block 3 of presented cards to block 3 of the previous card the reader scanned
+    // This renders cards unreadable and hardly recoverable unless the order of the scanned cards is known.
     {"(ELITE Bugger) - Renders cards unusable.", {0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBF, 0x18, 0xBF, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
-    //Reset Operations
+    // Reset Operations
     {"(RESET) - Reset READER to defaults", {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     {"(RESET) - Reset ENROLLER to defaults", {0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1C, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF}},
-    //Reader Master Key Operations
+    // Reader Master Key Operations
     {"(MASTER Key) - Change Reader Master Key to Custom Key", {0x28, 0xCB, 0x91, 0x9D, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-    {"(MASTER Key) - Restore Reader Master Key to Factory Defaults", {0x28, 0xCB, 0x91, 0x9D, 0x00, 0x00, 0x00, 0x1C, 0xE0, 0x5C, 0x91, 0xCF, 0x63, 0x34, 0x23, 0xB9}}
+    {"(MASTER Key) - Restore Reader Master Key to Factory Defaults", {0x28, 0xCB, 0x91, 0x9D, 0x00, 0x00, 0x00, 0x1C, 0xE0, 0x5C, 0x91, 0xCF, 0x63, 0x34, 0x23, 0xB9}},
+    {"", {0}}, // must be the last item
 };
 
 static const iclass_config_card_item_t *get_config_card_item(int idx) {
     if (idx > -1 && idx < ARRAYLEN(iclass_config_options)) {
         return &iclass_config_options[idx];
     }
-    return &iclass_config_options[ARRAYLEN(iclass_config_options)];
+    return &iclass_config_options[ARRAYLEN(iclass_config_options) - 1];
 }
 
 static void print_config_cards(void) {
@@ -441,8 +520,12 @@ static tagsim_key_t tagsim_poll_key(void) {
 
 static struct termios tagsim_saved_termios;
 static bool tagsim_rawmode_active = false;
+static bool tagsim_stdin_is_tty = false;
 
 static void tagsim_rawmode_enter(void) {
+    tagsim_stdin_is_tty = isatty(STDIN_FILENO);
+    if (tagsim_stdin_is_tty == false) return;
+
     if (tcgetattr(STDIN_FILENO, &tagsim_saved_termios) < 0) return;
     struct termios raw = tagsim_saved_termios;
     raw.c_lflag &= ~(uint32_t)(ICANON | ECHO);
@@ -462,6 +545,7 @@ static void tagsim_rawmode_exit(void) {
 static tagsim_key_t tagsim_poll_key(void) {
     char buf[8] = {0};
     int n = (int)read(STDIN_FILENO, buf, sizeof(buf));
+    if (n == 0 && tagsim_stdin_is_tty == false) return TAGSIM_KEY_ABORT;
     if (n <= 0) return TAGSIM_KEY_NONE;
     if (n == 1) {
         if (buf[0] == '\n' || buf[0] == '\r' || buf[0] == 0x1B)
@@ -1175,7 +1259,7 @@ static int CmdHFiClassSim(const char *Cmd) {
             PrintAndLogEx(INFO, "Press " _GREEN_("`pm3 button`") " to abort");
             uint8_t numberOfCSNs = 0;
             clearCommandBuffer();
-            SendCommandMIX(CMD_HF_ICLASS_SIMULATE, sim_type, numberOfCSNs, 1, csn, 8);
+            SendCommandMIX(CMD_HF_ICLASS_SIMULATE, sim_type, numberOfCSNs, 0, csn, 8);
 
             if (sim_type == ICLASS_SIM_MODE_FULL || sim_type ==  ICLASS_SIM_MODE_FULL_GLITCH || sim_type ==  ICLASS_SIM_MODE_FULL_GLITCH_KEY)
                 PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf iclass esave -h") "` to save the emulator memory to file");
@@ -1196,6 +1280,8 @@ static int CmdHFiClassTagSim(const char *Cmd) {
                   "the tool tries to load " ICLASS_DECRYPTION_BIN ".",
                   "hf iclass tagsim --fc 101 --cn 1337\n"
                   "hf iclass tagsim -w H10301 --fc 101 --cn 1337 --ki 0\n"
+                  "hf iclass tagsim -w H10301 --fc 101 --cn 1337 --enc none\n"
+                  "hf iclass tagsim -w H10301 --fc 101 --cn 1337 --enc des\n"
                   "hf iclass tagsim -w H10301 --fc 101 --cn 1337 --kd 0102030405060708 --elite\n"
                   "hf iclass tagsim --bin 10001111100000001010100011 --ki 0\n"
                   "hf iclass tagsim -w H10301 --fc 101 --cn 1337 --ki 0 --enckey 00000000000000000000000000000000\n"
@@ -1216,6 +1302,7 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         arg_lit0(NULL,  "raw",                    "Keys are already diversified, skip diversification"),
         arg_str0(NULL,  "csn",      "<hex>",      "Custom CSN, 8 hex bytes (auto-generated if omitted)"),
         arg_str0(NULL,  "enckey",   "<hex>",      "3DES transport key, 16 hex bytes"),
+        arg_str0(NULL,  "enc",      "<none|des|2k3des>", "credential transport mode (default: 2k3des)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -1268,8 +1355,14 @@ static int CmdHFiClassTagSim(const char *Cmd) {
     uint8_t *enckeyptr = NULL;
     bool have_enc_key = false;
     CLIGetHexWithReturn(ctx, 13, enc_key, &enc_key_len);
+    BLOCK79ENCRYPTION enc_mode = TRIPLEDES;
+    int enc_mode_res = CLIGetOptionList(arg_get_str(ctx, 14), IClassEncodeEncryptionOpts, (int *)&enc_mode);
 
     CLIParserFree(ctx);
+
+    if (enc_mode_res != 0) {
+        return PM3_EINVARG;
+    }
 
     // --- validation
     if ((rawkey + elite) > 1) {
@@ -1337,9 +1430,16 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         have_enc_key = true;
     }
 
-    if (have_enc_key == false) {
-        // try smart-card helper first, then fall back to file
-        bool use_sc = IsCardHelperPresent(false);
+    bool use_sc = false;
+    if (enc_mode == None && have_enc_key) {
+        PrintAndLogEx(WARNING, "Transport mode marker is none; --enckey will be ignored.");
+    }
+
+    if (enc_mode != None && have_enc_key == false) {
+        // Try smart-card helper for 2K3DES only, then fall back to file.
+        if (enc_mode == TRIPLEDES) {
+            use_sc = IsCardHelperPresent(false);
+        }
         if (use_sc == false) {
             size_t keylen = 0;
             int res = loadFile_safe(ICLASS_DECRYPTION_BIN, "", (void **)&enckeyptr, &keylen);
@@ -1355,6 +1455,10 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         } else {
             have_enc_key = true; // will use Encrypt() via smart card
         }
+    }
+
+    if (enc_mode != None && have_enc_key == false) {
+        enc_mode = None;
     }
 
     // ---------------------------------------------------------------
@@ -1373,7 +1477,10 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         dump[1] = (uint8_t)((fc >> 4) ^ (cn & 0xFF) ^ 0x5C);
         dump[2] = (uint8_t)((cn >> 16) ^ fc ^ 0x7F);
         dump[3] = (uint8_t)((cn >> 8) ^ (fc << 3) ^ 0xE9);
-        dump[4] = 0xF7; dump[5] = 0xFF; dump[6] = 0x12; dump[7] = 0xE0;
+        dump[4] = 0xF7;
+        dump[5] = 0xFF;
+        dump[6] = 0x12;
+        dump[7] = 0xE0;
     }
     memcpy(csn, dump, 8);
 
@@ -1454,19 +1561,15 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         memcpy(credential + 12, &packed.Bot, sizeof(packed.Bot));
     }
 
-    // Capture smart-card helper state before starting simulation (can't query mid-sim)
-    bool use_sc = have_enc_key ? IsCardHelperPresent(false) : false;
-
-    // Encrypt credential blocks 7, 8, 9
-    if (have_enc_key) {
+    iclass_set_transport_mode(credential, enc_mode);
+    if (enc_mode != None) {
         if (use_sc) {
             Encrypt(credential + 8,  credential + 8);
             Encrypt(credential + 16, credential + 16);
             Encrypt(credential + 24, credential + 24);
-        } else {
-            iclass_encrypt_block_data(credential + 8,  enc_key);
-            iclass_encrypt_block_data(credential + 16, enc_key);
-            iclass_encrypt_block_data(credential + 24, enc_key);
+        } else if (iclass_apply_transport_mode_to_credential(credential + 8, enc_key, enc_mode, true) != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to encode credential transport blocks");
+            return PM3_EINVARG;
         }
     }
 
@@ -1502,16 +1605,17 @@ static int CmdHFiClassTagSim(const char *Cmd) {
     }
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_ICLASS_SIMULATE, ICLASS_SIM_MODE_FULL, 0, 1, csn, 8);
+    SendCommandMIX(CMD_HF_ICLASS_SIMULATE, ICLASS_SIM_MODE_FULL_LIVE, 0, 1, csn, 8);
+
+    PacketResponseNG resp;
+    bool running = true;
+    bool arm_ended = false;  // true when ARM sent its own CMD_ACK (e.g. button press)
 
     // --- live FC/CN navigation (wiegand mode only; binary mode has no FC/CN to adjust)
     if (bin_len == 0) {
         int format_idx = HIDFindCardFormat(format);
 
         tagsim_rawmode_enter();
-        PacketResponseNG resp;
-        bool running = true;
-        bool arm_ended = false;  // true when ARM sent its own CMD_ACK (e.g. button press)
 
         while (running) {
             // A non-zero-timeout poll lets us detect when the ARM ends the sim
@@ -1526,12 +1630,23 @@ static int CmdHFiClassTagSim(const char *Cmd) {
             if (k == TAGSIM_KEY_NONE)  { continue; }
 
             switch (k) {
-                case TAGSIM_KEY_FC_INC: card.FacilityCode++; break;
-                case TAGSIM_KEY_FC_DEC: card.FacilityCode--; break;
-                case TAGSIM_KEY_CN_INC: card.CardNumber++;   break;
-                case TAGSIM_KEY_CN_DEC: card.CardNumber--;   break;
-                case TAGSIM_KEY_ABORT:  running = false;     break;
-                case TAGSIM_KEY_NONE:                        break;
+                case TAGSIM_KEY_FC_INC:
+                    card.FacilityCode++;
+                    break;
+                case TAGSIM_KEY_FC_DEC:
+                    card.FacilityCode--;
+                    break;
+                case TAGSIM_KEY_CN_INC:
+                    card.CardNumber++;
+                    break;
+                case TAGSIM_KEY_CN_DEC:
+                    card.CardNumber--;
+                    break;
+                case TAGSIM_KEY_ABORT:
+                    running = false;
+                    break;
+                case TAGSIM_KEY_NONE:
+                    break;
             }
 
             // Rebuild CSN deterministically from new FC/CN
@@ -1542,7 +1657,10 @@ static int CmdHFiClassTagSim(const char *Cmd) {
                 csn[1] = (uint8_t)((fc >> 4) ^ (cn & 0xFF) ^ 0x5C);
                 csn[2] = (uint8_t)((cn >> 16) ^ fc ^ 0x7F);
                 csn[3] = (uint8_t)((cn >> 8) ^ (fc << 3) ^ 0xE9);
-                csn[4] = 0xF7; csn[5] = 0xFF; csn[6] = 0x12; csn[7] = 0xE0;
+                csn[4] = 0xF7;
+                csn[5] = 0xFF;
+                csn[6] = 0x12;
+                csn[7] = 0xE0;
             }
 
             // New diversified KD/KC for the new CSN
@@ -1578,15 +1696,16 @@ static int CmdHFiClassTagSim(const char *Cmd) {
                 }
             }
 
-            if (have_enc_key) {
+            iclass_set_transport_mode(new_cred, enc_mode);
+            if (enc_mode != None) {
                 if (use_sc) {
                     Encrypt(new_cred + 8,  new_cred + 8);
                     Encrypt(new_cred + 16, new_cred + 16);
                     Encrypt(new_cred + 24, new_cred + 24);
-                } else {
-                    iclass_encrypt_block_data(new_cred + 8,  enc_key);
-                    iclass_encrypt_block_data(new_cred + 16, enc_key);
-                    iclass_encrypt_block_data(new_cred + 24, enc_key);
+                } else if (iclass_apply_transport_mode_to_credential(new_cred + 8, enc_key, enc_mode, true) != PM3_SUCCESS) {
+                    PrintAndLogEx(ERR, "Failed to encode credential transport blocks");
+                    running = false;
+                    break;
                 }
             }
 
@@ -1604,14 +1723,30 @@ static int CmdHFiClassTagSim(const char *Cmd) {
         }
 
         tagsim_rawmode_exit();
+    } else {
+        tagsim_rawmode_enter();
 
-        if (!arm_ended) {
-            // Client exited the loop (Enter/Esc) but the ARM is still simulating.
-            // Tell it to stop and consume the resulting CMD_ACK so the ARM is
-            // cleanly back in the main loop before we return.
-            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
-            WaitForResponseTimeout(CMD_ACK, &resp, 2000);
+        while (running) {
+            if (WaitForResponseTimeout(CMD_ACK, &resp, 100)) {
+                arm_ended = true;
+                running = false;
+                break;
+            }
+            if (tagsim_poll_key() == TAGSIM_KEY_ABORT) {
+                running = false;
+                break;
+            }
         }
+
+        tagsim_rawmode_exit();
+    }
+
+    if (!arm_ended) {
+        // Client exited the loop (Enter/Esc) but the ARM is still simulating.
+        // Tell it to stop and consume the resulting CMD_ACK so the ARM is
+        // cleanly back in the main loop before we return.
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+        WaitForResponseTimeout(CMD_ACK, &resp, 2000);
     }
 
     PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf iclass esave -h") "` to save the emulator memory to file");
@@ -1638,7 +1773,8 @@ static int CmdHFiClassInfo(const char *Cmd) {
 int read_iclass_csn(bool loop, bool verbose, bool shallow_mod) {
 
     iclass_card_select_t payload = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support for reader mode yet
     };
 
     if (shallow_mod) {
@@ -2097,7 +2233,7 @@ static void iclass_decode_credentials(uint8_t *data) {
 static int CmdHFiClassDecrypt(const char *Cmd) {
     CLIParserContext *clictx;
     CLIParserInit(&clictx, "hf iclass decrypt",
-                  "3DES decrypt data\n"
+                  "DES/3DES decrypt data\n"
                   "This is a naive implementation, it tries to decrypt every block after block 6.\n"
                   "Correct behaviour would be to decrypt only the application areas where the key is valid,\n"
                   "which is defined by the configuration block.\n"
@@ -2113,8 +2249,9 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
     void *argtable[] = {
         arg_param_begin,
         arg_str0("f", "file", "<fn>", "Specify a filename for dump file"),
-        arg_str0("d", "data", "<hex>", "3DES encrypted data"),
-        arg_str0("k", "key", "<hex>", "3DES transport key"),
+        arg_str0("d", "data", "<hex>", "DES/3DES encrypted data"),
+        arg_str0("k", "key", "<hex>", "DES/3DES transport key"),
+        arg_str0(NULL, "enc", "[des|2k3des]", "transport encryption mode"),
         arg_lit0("v", "verbose", "verbose output"),
         arg_lit0(NULL, "d6", "decode as block 6"),
         arg_lit0("z", "dense", "dense dump output style"),
@@ -2140,10 +2277,16 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
 
     CLIGetHexWithReturn(clictx, 3, key, &key_len);
 
-    bool verbose = arg_get_lit(clictx, 4);
-    bool use_decode6 = arg_get_lit(clictx, 5);
-    bool dense_output = g_session.dense_output || arg_get_lit(clictx, 6);
-    bool nosave = arg_get_lit(clictx, 7);
+    int transport_mode = TRIPLEDES;
+    if (CLIGetOptionList(arg_get_str(clictx, 4), IClassTransportEncryptionOpts, &transport_mode)) {
+        CLIParserFree(clictx);
+        return PM3_EINVARG;
+    }
+
+    bool verbose = arg_get_lit(clictx, 5);
+    bool use_decode6 = arg_get_lit(clictx, 6);
+    bool dense_output = g_session.dense_output || arg_get_lit(clictx, 7);
+    bool nosave = arg_get_lit(clictx, 8);
     CLIParserFree(clictx);
 
     // sanity checks
@@ -2184,15 +2327,9 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
     bool use_sc = false;
     if (have_key == false) {
         use_sc = IsCardHelperPresent(verbose);
-        if (use_sc == false) {
-            size_t keylen = 0;
-            res = loadFile_safe(ICLASS_DECRYPTION_BIN, "", (void **)&keyptr, &keylen);
-            if (res != PM3_SUCCESS) {
-                PrintAndLogEx(INFO, "Couldn't find any decryption methods");
-                free(decrypted);
-                return PM3_EINVARG;
-            }
-
+        size_t keylen = 0;
+        res = loadFile_safe(ICLASS_DECRYPTION_BIN, "", (void **)&keyptr, &keylen);
+        if (res == PM3_SUCCESS) {
             if (keylen != 16) {
                 PrintAndLogEx(ERR, "Failed to load transport key from file");
                 free(keyptr);
@@ -2201,21 +2338,30 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
             }
             memcpy(key, keyptr, sizeof(key));
             free(keyptr);
+            have_key = true;
+        } else if (use_sc == false) {
+            PrintAndLogEx(INFO, "Couldn't find any decryption methods");
+            free(decrypted);
+            return PM3_EINVARG;
         }
     }
-
-    // tripledes
-    mbedtls_des3_context ctx;
-    mbedtls_des3_set2key_dec(&ctx, key);
 
     // decrypt user supplied data
     if (have_data) {
 
         uint8_t dec_data[PICOPASS_BLOCK_SIZE] = {0};
-        if (use_sc) {
+        memcpy(dec_data, enc_data, sizeof(dec_data));
+        if (use_sc && transport_mode == TRIPLEDES) {
             Decrypt(enc_data, dec_data);
+        } else if (have_key) {
+            if (iclass_apply_transport_mode_to_block(dec_data, key, (BLOCK79ENCRYPTION)transport_mode, false) != PM3_SUCCESS) {
+                free(decrypted);
+                return PM3_EINVARG;
+            }
         } else {
-            mbedtls_des3_crypt_ecb(&ctx, enc_data, dec_data);
+            PrintAndLogEx(INFO, "Couldn't find any decryption methods");
+            free(decrypted);
+            return PM3_EINVARG;
         }
 
         PrintAndLogEx(SUCCESS, "encrypted... %s", sprint_hex_inrow(enc_data, sizeof(enc_data)));
@@ -2258,19 +2404,26 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
             memcpy(enc_data, decrypted + idx, PICOPASS_BLOCK_SIZE);
 
             switch (aa1_encryption) {
-                // Right now, only 3DES is supported
+                case DES:
                 case TRIPLEDES:
                     // Decrypt block 7,8,9 if configured.
-                    if (blocknum > 6 && blocknum <= 9 && memcmp(enc_data, empty, PICOPASS_BLOCK_SIZE) != 0) {
-                        if (use_sc) {
+                    if (blocknum > 6 && blocknum <= 9 && memcmp(enc_data, empty, PICOPASS_BLOCK_SIZE) != 0 && memcmp(enc_data, zeros, PICOPASS_BLOCK_SIZE) != 0) {
+                        if (use_sc && aa1_encryption == TRIPLEDES) {
                             Decrypt(enc_data, decrypted + idx);
+                        } else if (have_key) {
+                            memcpy(decrypted + idx, enc_data, PICOPASS_BLOCK_SIZE);
+                            if (iclass_apply_transport_mode_to_block(decrypted + idx, key, aa1_encryption, false) != PM3_SUCCESS) {
+                                free(decrypted);
+                                return PM3_EINVARG;
+                            }
                         } else {
-                            mbedtls_des3_crypt_ecb(&ctx, enc_data, decrypted + idx);
+                            PrintAndLogEx(INFO, "Couldn't find any decryption methods");
+                            free(decrypted);
+                            return PM3_EINVARG;
                         }
                         decrypted_block789 = true;
                     }
                     break;
-                case DES:
                 case RFU:
                 case None:
                 // Nothing to do for None anyway...
@@ -2340,14 +2493,13 @@ static int CmdHFiClassDecrypt(const char *Cmd) {
         free(decrypted);
     }
 
-    mbedtls_des3_free(&ctx);
     return PM3_SUCCESS;
 }
 
 static int CmdHFiClassEncryptBlk(const char *Cmd) {
     CLIParserContext *clictx;
     CLIParserInit(&clictx, "hf iclass encrypt",
-                  "3DES encrypt data\n"
+                  "DES/3DES encrypt data\n"
                   "OBS! In order to use this function, the file 'iclass_decryptionkey.bin' must reside\n"
                   "in the resources directory. The file should be 16 hex bytes of binary data",
                   "hf iclass encrypt -d 0102030405060708\n"
@@ -2356,7 +2508,8 @@ static int CmdHFiClassEncryptBlk(const char *Cmd) {
     void *argtable[] = {
         arg_param_begin,
         arg_str1("d", "data", "<hex>", "data to encrypt"),
-        arg_str0("k", "key", "<hex>", "3DES transport key"),
+        arg_str0("k", "key", "<hex>", "DES/3DES transport key"),
+        arg_str0(NULL, "enc", "[des|2k3des]", "transport encryption mode"),
         arg_lit0("v", "verbose", "verbose output"),
         arg_param_end
     };
@@ -2380,6 +2533,12 @@ static int CmdHFiClassEncryptBlk(const char *Cmd) {
 
     CLIGetHexWithReturn(clictx, 2, key, &key_len);
 
+    int transport_mode = TRIPLEDES;
+    if (CLIGetOptionList(arg_get_str(clictx, 3), IClassTransportEncryptionOpts, &transport_mode)) {
+        CLIParserFree(clictx);
+        return PM3_EINVARG;
+    }
+
     if (key_len > 0) {
         if (key_len != 16) {
             PrintAndLogEx(ERR, "Transport key must be 16 hex bytes (32 HEX characters)");
@@ -2389,13 +2548,15 @@ static int CmdHFiClassEncryptBlk(const char *Cmd) {
         have_key = true;
     }
 
-    bool verbose = arg_get_lit(clictx, 3);
+    bool verbose = arg_get_lit(clictx, 4);
 
     CLIParserFree(clictx);
 
     bool use_sc = false;
     if (have_key == false) {
-        use_sc = IsCardHelperPresent(verbose);
+        if (transport_mode == TRIPLEDES) {
+            use_sc = IsCardHelperPresent(verbose);
+        }
         if (use_sc == false) {
             size_t keylen = 0;
             int res = loadFile_safe(ICLASS_DECRYPTION_BIN, "", (void **)&keyptr, &keylen);
@@ -2417,10 +2578,10 @@ static int CmdHFiClassEncryptBlk(const char *Cmd) {
 
     PrintAndLogEx(SUCCESS, "plain....... %s", sprint_hex_inrow(blk_data, sizeof(blk_data)));
 
-    if (use_sc) {
+    if (use_sc && transport_mode == TRIPLEDES) {
         Encrypt(blk_data, blk_data);
-    } else {
-        iclass_encrypt_block_data(blk_data, key);
+    } else if (iclass_apply_transport_mode_to_block(blk_data, key, (BLOCK79ENCRYPTION)transport_mode, true) != PM3_SUCCESS) {
+        return PM3_EINVARG;
     }
 
     PrintAndLogEx(SUCCESS, "encrypted... " _YELLOW_("%s"), sprint_hex_inrow(blk_data, sizeof(blk_data)));
@@ -2430,7 +2591,8 @@ static int CmdHFiClassEncryptBlk(const char *Cmd) {
 static bool select_only(uint8_t *CSN, uint8_t *CCNR, bool verbose, bool shallow_mod) {
 
     iclass_card_select_t payload = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support here yet
     };
 
     if (shallow_mod) {
@@ -2480,7 +2642,8 @@ static bool select_only(uint8_t *CSN, uint8_t *CCNR, bool verbose, bool shallow_
 static int iclass_dump_non_secure(bool shallow_mod, uint8_t *tag_data, uint16_t *taglen) {
 
     iclass_card_select_t payload_rdr = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support here yet
     };
 
     if (shallow_mod) {
@@ -2529,6 +2692,7 @@ static int iclass_dump_non_secure(bool shallow_mod, uint8_t *tag_data, uint16_t 
         .req.shallow_mod    = shallow_mod,
         .start_block        = 3,
         .end_block          = app_limit1,
+        .page = 0 // no page selection support here yet
     };
 
     clearCommandBuffer();
@@ -2605,6 +2769,7 @@ static int CmdHFiClassDump(const char *Cmd) {
         arg_lit0(NULL, "force", "force unsecure card read"),
         arg_lit0(NULL, "shallow", "use shallow (ASK) reader modulation instead of OOK"),
         arg_lit0(NULL, "ns", "no save to file"),
+        arg_int0(NULL, "page", "<dec>", "which page to dump from"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -2631,6 +2796,7 @@ static int CmdHFiClassDump(const char *Cmd) {
     bool force = arg_get_lit(ctx, 10);
     bool shallow_mod = arg_get_lit(ctx, 11);
     bool nosave = arg_get_lit(ctx, 12);
+    int page = arg_get_int_def(ctx, 13, 0);
 
     CLIParserFree(ctx);
 
@@ -2701,7 +2867,8 @@ static int CmdHFiClassDump(const char *Cmd) {
     memset(tag_data, 0xFF, sizeof(tag_data));
 
     iclass_card_select_t payload_rdr = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = page
     };
 
     if (shallow_mod) {
@@ -2790,6 +2957,7 @@ static int CmdHFiClassDump(const char *Cmd) {
         .req.do_auth = auth,
         .req.shallow_mod = shallow_mod,
         .end_block = app_limit1,
+        .page = page,
     };
     memcpy(payload.req.key, key, 8);
 
@@ -3832,7 +4000,7 @@ static int CmdHFiClass_TearBlock(const char *Cmd) {
             return PM3_EINVARG;
         }
     } else {
-            PrintAndLogEx(SUCCESS, "Using Key... " _GREEN_("%s"), sprint_hex_inrow(key, sizeof(key)));
+        PrintAndLogEx(SUCCESS, "Using Key... " _GREEN_("%s"), sprint_hex_inrow(key, sizeof(key)));
     }
 
     if (data_len && data_len != 8) {
@@ -3890,13 +4058,14 @@ static int CmdHFiClass_TearBlock(const char *Cmd) {
 
     //check if the card is in secure mode or not
     iclass_card_select_t payload_rdr = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support for tearblock yet
     };
 
     if (shallow_mod) {
         payload_rdr.flags |= FLAG_ICLASS_READER_SHALLOW_MOD;
     }
-    
+
     clearCommandBuffer();
     PacketResponseNG resp;
     SendCommandNG(CMD_HF_ICLASS_READER, (uint8_t *)&payload_rdr, sizeof(iclass_card_select_t));
@@ -4181,8 +4350,8 @@ static int CmdHFiClass_TearBlock(const char *Cmd) {
                 if (blockno == 2) {
                     if (memcmp(data_read, ff_data, 8) == 0 && memcmp(data_read_orig, ff_data, 8) != 0) {
                         PrintAndLogEx(SUCCESS, "E-purse has been teared ( %s )", _GREEN_("ok"));
-                        PrintAndLogEx(HINT, "Hint: try `hf iclass creditepurse -d FEFFFEFF --ki 1`");
-                        PrintAndLogEx(HINT, "Hint: try `hf iclass wrbl -d 'FFFFFFFF FFFF FEFF' --blk 2 --ki 1 --credit`");
+                        PrintAndLogEx(HINT, "Hint: Try `hf iclass creditepurse -d FEFFFEFF --ki 1`");
+                        PrintAndLogEx(HINT, "Hint: Try `hf iclass wrbl -d 'FFFFFFFF FFFF FEFF' --blk 2 --ki 1 --credit`");
                         isok = PM3_SUCCESS;
                         goto_out = true;
                     }
@@ -4215,7 +4384,13 @@ static int CmdHFiClass_TearBlock(const char *Cmd) {
                         for (int i = 7; i >= 0; --i) {
                             int bit1 = (data_read_orig[7] >> i) & 1;
                             int bit2 = (data_read[7] >> i) & 1;
-                            PrintAndLogEx(INFO, "%-11s %-10d %-10d", flag_names[i], bit1, bit2);
+
+                            // if bit flipped,  mark it with color
+                            if (bit1 != bit2) {
+                                PrintAndLogEx(SUCCESS, "%-11s %-10d " _GREEN_("%-10d"), flag_names[i], bit1, bit2);
+                            } else {
+                                PrintAndLogEx(INFO, "%-11s %-10d %-10d", flag_names[i], bit1, bit2);
+                            }
                         }
 
                         isok = PM3_SUCCESS;
@@ -4292,28 +4467,28 @@ out:
 
 static void iclass_read_interesting_data(uint8_t *key, uint8_t keyType, bool elite, bool rawkey, bool use_replay,
                                          bool verbose, bool shallow_mod) {
-        bool auth = false;
-        uint8_t blockno = 3;
-        uint8_t kd_read[8] = {0};
-        iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, auth, shallow_mod, kd_read, false, false);
+    bool auth = false;
+    uint8_t blockno = 3;
+    uint8_t kd_read[8] = {0};
+    iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, auth, shallow_mod, kd_read, false, false);
 
-        blockno = 4;
-        uint8_t kc_read[8] = {0};
-        iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, auth, shallow_mod, kc_read, false, false);
+    blockno = 4;
+    uint8_t kc_read[8] = {0};
+    iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, auth, shallow_mod, kc_read, false, false);
 
-        PrintAndLogEx(SUCCESS, "Raw Debit Key.............. " _YELLOW_("%s"), sprint_hex_inrow(kd_read, sizeof(kd_read)));
-        PrintAndLogEx(SUCCESS, "Raw Credit Key............. " _YELLOW_("%s"), sprint_hex_inrow(kc_read, sizeof(kc_read)));
+    PrintAndLogEx(SUCCESS, "Raw Debit Key.............. " _YELLOW_("%s"), sprint_hex_inrow(kd_read, sizeof(kd_read)));
+    PrintAndLogEx(SUCCESS, "Raw Credit Key............. " _YELLOW_("%s"), sprint_hex_inrow(kc_read, sizeof(kc_read)));
 
-        // read dump data here and print (SIO ,  wiegand)
-        uint16_t n = 0;
-        uint8_t d[0x100 * PICOPASS_BLOCK_SIZE] = {0};
-        iclass_dump_non_secure(shallow_mod, d, &n);
+    // read dump data here and print (SIO ,  wiegand)
+    uint16_t n = 0;
+    uint8_t d[0x100 * PICOPASS_BLOCK_SIZE] = {0};
+    iclass_dump_non_secure(shallow_mod, d, &n);
 
-        DropField();
+    DropField();
 
-        iclass_decode_credentials(d);
+    iclass_decode_credentials(d);
 
-        // We should send it to SAM if we detect one installed,  and  get the FC/CN out
+    // We should send it to SAM if we detect one installed,  and  get the FC/CN out
 }
 
 static int CmdHFiClass_BlackTears(const char *Cmd) {
@@ -4331,9 +4506,10 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
         arg_int0(NULL, "ki", "<dec>", "Key index to select key from memory 'hf iclass managekeys'"),
         arg_lit0(NULL, "credit", "key is assumed to be the credit key"),
         arg_int0("s", NULL, "<dec>", "tearoff delay start (in us) must be between 1 and 43000 (43ms). Precision is about 1/3 us"),
-        arg_int0("i", NULL, "<dec>", "tearoff delay increment (in us) - default 10"),
+        arg_int0("i", NULL, "<dec>", "tearoff delay increment (in us) - default 5"),
         arg_int0("e", NULL, "<dec>", "tearoff delay end (in us) must be a higher value than the start delay"),
         arg_str0("o", "otp", "<hex>", "Custom OTP value as 2 hex bytes"),
+        arg_lit0(NULL, "dns", "Do not stabilize the bits, and return the raw dump of the block after tearoff"),
         arg_lit0(NULL, "raw", "no computations applied to key"),
         arg_lit0("v", "verbose", "verbose output"),
         arg_lit0(NULL, "shallow", "use shallow (ASK) reader modulation instead of OOK"),
@@ -4360,9 +4536,11 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
     uint8_t otp[2] = {0};
     CLIGetHexWithReturn(ctx, 7, otp, &otp_len);
 
-    bool rawkey = arg_get_lit(ctx, 8);
-    bool verbose = arg_get_lit(ctx, 9);
-    bool shallow_mod = arg_get_lit(ctx, 10);
+    bool do_not_stabilize = arg_get_lit(ctx, 8);
+    bool rawkey = arg_get_lit(ctx, 9);
+    bool verbose = arg_get_lit(ctx, 10);
+    bool shallow_mod = arg_get_lit(ctx, 11);
+
     CLIParserFree(ctx);
 
     bool elite = false;
@@ -4422,7 +4600,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
         keyType = ICLASS_CREDIT_KEYTYPE;
     } else {
         PrintAndLogEx(SUCCESS, "Using " _YELLOW_("debit") " key");
-    }    
+    }
 
     if (tearoff_loop > 1) {
         PrintAndLogEx(SUCCESS, _YELLOW_("%u") " attempts / tearoff", tearoff_loop);
@@ -4434,7 +4612,8 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
 
     //check if the card is in secure mode or not
     iclass_card_select_t payload_rdr = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support for blacktears yet
     };
 
     clearCommandBuffer();
@@ -4487,40 +4666,29 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
         goto out;
     }
 
-    #define TEAR_NON_SECURE_MODE    0x2C
-    #define TEAR_INITAL             0x3C
-    #define TEAR_PERSO              0xAC
+#define TEAR_NON_SECURE_MODE    0x2C
+#define TEAR_INITAL             0x3C
+#define TEAR_PERSO              0xAC
 
-    #define TEAR_IS_PERSO_SET(x)        (((x) & 0x80) == 0x80)
-    #define TEAR_IS_NONSECURE_SET(x)    ((((x) & 0x18) >> 3) == PICOPASS_NON_SECURE_PAGEMODE)
-    #define TEAR_BAD(x)                 (((x) & 0x01) == 0)  
+#define TEAR_IS_PERSO_SET(x)        (((x) & 0x80) == 0x80)
+#define TEAR_IS_NONSECURE_SET(x)    ((((x) & 0x18) >> 3) == PICOPASS_NON_SECURE_PAGEMODE)
+#define TEAR_BAD(x)                 (((x) & 0x01) == 0)
 
     // perform initial read here, repeat if failed or 00s
 
     uint8_t data_read_orig[8] = {0};
     uint8_t ff_data[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     bool first_read = false;
-    bool reread = false;
     bool erase_phase = false;
 
     read_auth = false;
 
     int blockno = 1;
-    
+
     int res_orig = iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, read_auth, shallow_mod, data_read_orig, false, false);
-    while (reread) {
-        if (res_orig == PM3_SUCCESS && !reread) {
-            if (memcmp(data_read_orig, zeros, 8) == 0) {
-                reread = true;
-            } else {
-                reread = false;
-            }
-        } else if (res_orig == PM3_SUCCESS && reread) {
-            reread = false;
-            if (blockno == 2 && memcmp(data_read_orig, zeros, 8) == 0) {
-                reread = true;
-            }
-        }
+    if (res_orig == PM3_SUCCESS && memcmp(data_read_orig, zeros, 8) == 0) {
+        // zeros may be a transient read artifact - read once more to confirm
+        res_orig = iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, read_auth, shallow_mod, data_read_orig, false, false);
     }
 
     uint8_t data[8] = { 0 }; // tearoff payload
@@ -4594,7 +4762,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
         // read the data back
         uint8_t data_read[8] = {0};
         first_read = false;
-        reread = false;
+        bool reread = false;
         bool decrease = false;
         int readcount = 0;
         while (first_read == false) {
@@ -4606,7 +4774,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
             }
 
             // skip authentication for config block
-            read_auth = false;                
+            read_auth = false;
 
             res = iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, read_auth, shallow_mod, data_read, false, false);
             if (res == PM3_SUCCESS && !reread) {
@@ -4621,6 +4789,9 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
                 reread = false;
             } else if (res != PM3_SUCCESS) {
                 decrease = true;
+                if (readcount == 100) {
+                    PrintAndLogEx(WARNING, "\nCard not responding after %d attempts, press " _GREEN_("<Enter>") " to abort", readcount);
+                }
             }
 
             readcount++;
@@ -4678,7 +4849,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
             bool goto_out = false;
 
             // App limit became SMALLER :(
-            if (data_read[0] > data_read_orig[0]) {
+            if (data_read[0] < data_read_orig[0]) {
 
                 PrintAndLogEx(NORMAL, "");
                 PrintAndLogEx(SUCCESS, "Application limit changed, from "_YELLOW_("%u")" to "_YELLOW_("%u"), data_read_orig[0], data_read[0]);
@@ -4732,7 +4903,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
                 isok = PM3_SUCCESS;
                 goto_out = true;
             }
-            
+
 
             if (goto_out) {
                 goto out;
@@ -4746,9 +4917,9 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
 
             PrintAndLogEx(NORMAL, "");
             PrintAndLogEx(INFO, "Read:     " _GREEN_("%s") " %s"
-                            , sprint_hex_inrow(data_read, sizeof(data_read)),
-                            (expected_values) ? _GREEN_(" -> Expected values!") : ""
-                            );
+                          , sprint_hex_inrow(data_read, sizeof(data_read)),
+                          (expected_values) ? _GREEN_(" -> Expected values!") : ""
+                         );
         }
 
         loop_count++;
@@ -4762,7 +4933,7 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
             msleep(tearoff_sleep);
         }
     }
-    
+
 
 out:
 
@@ -4785,9 +4956,9 @@ out:
     PrintAndLogEx(NORMAL, "");
     clearCommandBuffer();
 
-    read_auth = false; 
-    uint8_t data_read[8]= {0};   
-    
+    read_auth = false;
+    uint8_t data_read[8] = {0};
+
     int res = iclass_read_block_ex(key, blockno, keyType, elite, rawkey, use_replay, verbose, read_auth, shallow_mod, data_read, false, false);
     if (res != PM3_SUCCESS) {
         return res;
@@ -4795,30 +4966,35 @@ out:
 
     uint8_t b7 = data_read[7];
 
-    if ( b7 == TEAR_INITAL) {
-            PrintAndLogEx(INFO, _YELLOW_("Fuses unchanged. Try again if the OTP is unchanged"));
-            // check for OTP change?
+    if (b7 == TEAR_INITAL) {
+        PrintAndLogEx(INFO, _YELLOW_("Fuses unchanged. Try again if the OTP is unchanged"));
+        // check for OTP change?
     } else if (TEAR_IS_NONSECURE_SET(b7)) {
-            // don't do anything as this is ok
-            PrintAndLogEx(SUCCESS, "Detected fuse: " _GREEN_("0x%02X")" _non secure memory_ ( %s )", data_read[7], _GREEN_("ok"));
+        // don't do anything as this is ok
+        PrintAndLogEx(SUCCESS, "Detected fuse: " _GREEN_("0x%02X")" _non secure memory_ ( %s )", data_read[7], _GREEN_("ok"));
 
-            iclass_read_interesting_data(key, keyType, elite, rawkey, use_replay, verbose, shallow_mod);
+        iclass_read_interesting_data(key, keyType, elite, rawkey, use_replay, verbose, shallow_mod);
     } else if (TEAR_IS_PERSO_SET(b7)) {
 
-            PrintAndLogEx(SUCCESS, "Detected fuse: " _GREEN_("0x%02X") " set non-secure memory: " _YELLOW_("0xAC"), data_read[7]);
+        PrintAndLogEx(SUCCESS, "Detected fuse: " _GREEN_("0x%02X") " set non-secure memory: " _YELLOW_("0xAC"), data_read[7]);
 
-            memcpy(data, data_read, PICOPASS_BLOCK_SIZE);
-            data[7] = TEAR_NON_SECURE_MODE;
+        memcpy(data, data_read, PICOPASS_BLOCK_SIZE);
+        data[7] = TEAR_NON_SECURE_MODE;
 
-            // set non-secure memory with 0xAC,  in this state it will always succeed
+        // set non-secure memory with 0xAC,  in this state it will always succeed
+        if (do_not_stabilize) {
+            PrintAndLogEx(INFO, "Not stabilizing the bits...");
+        } else {
+            PrintAndLogEx(INFO, "Stabilizing the bits...");
             iclass_write_block(blockno, data, mac, key, use_credit_key, elite, rawkey, use_replay, false, auth, shallow_mod);
+        }
 
-            iclass_read_interesting_data(key, keyType, elite, rawkey, use_replay, verbose, shallow_mod);
+        iclass_read_interesting_data(key, keyType, elite, rawkey, use_replay, verbose, shallow_mod);
     } else if (TEAR_BAD(b7)) {
         PrintAndLogEx(WARNING, "Bad fuse state detected: " _RED_("0x%02X") ", cannot proceed", b7);
         return PM3_EFAILED;
     } else {
-        PrintAndLogEx(INFO, _YELLOW_("Did not detect " _YELLOW_("0xBC") " or " _YELLOW_("0xBE") " or " _YELLOW_("0x9C") " fuse, might need manual intervention!"));       
+        PrintAndLogEx(INFO, _YELLOW_("Did not detect " _YELLOW_("0xBC") " or " _YELLOW_("0xBE") " or " _YELLOW_("0x9C") " fuse, might need manual intervention!"));
     }
 
     return isok;
@@ -4911,13 +5087,17 @@ static void detect_credential(uint8_t *iclass_dump, size_t dump_len, bool *is_le
                 }
             }
         }
-    } else if (memcmp(hdr->app_issuer_area, "\xFF\xFF\xFF\x00\x06\xFF\xFF\xFF", PICOPASS_BLOCK_SIZE) == 0) {
+    } else {
+        uint8_t blockno = hdr->app_issuer_area[4];
+        if (blockno < 0x06 || blockno == 0xFF || dump_len < (blockno + 1) * PICOPASS_BLOCK_SIZE) {
+            return;
+        }
+
         // SE AIA
         *is_se = true;
 
         if (sio_start_ptr != NULL) {
-            // SE SIO starts at block 6
-            *sio_start_ptr = iclass_dump + (6 * PICOPASS_BLOCK_SIZE);
+            *sio_start_ptr = iclass_dump + (blockno * PICOPASS_BLOCK_SIZE);
         }
     }
 
@@ -4930,11 +5110,13 @@ static void detect_credential(uint8_t *iclass_dump, size_t dump_len, bool *is_le
 
     if (sio_start[0] != 0x30) {
         // SIOs always start with a SEQUENCE(P), if this is missing then bail
+        *sio_start_ptr = NULL;
         return;
     }
 
     if (sio_start[1] >= 0x80 || sio_start[1] == 0x00) {
         // We only support definite short form lengths
+        *sio_start_ptr = NULL;
         return;
     }
 
@@ -4994,18 +5176,30 @@ static void print_iclass_sio_decoded(uint8_t *sio, size_t sio_len) {
                     } else if (itag == 0x81 && ilen == 1) {
                         const char *ktype;
                         switch (ival[0]) {
-                            case 0x00: ktype = "Elite keyed"; break;
-                            case 0x01: ktype = "Standard keyed"; break;
-                            default:   ktype = "Custom keyed"; break;
+                            case 0x00:
+                                ktype = "Elite keyed";
+                                break;
+                            case 0x01:
+                                ktype = "Standard keyed";
+                                break;
+                            default:
+                                ktype = "Custom keyed";
+                                break;
                         }
                         PrintAndLogEx(INFO, "  Key Reference ID   : " _YELLOW_("0x%02X") " ( %s )", ival[0], ktype);
                     } else if (itag == 0x04 && ilen >= 1) {
                         uint8_t ctype = ival[ilen - 1];
                         const char *cname;
                         switch (ctype) {
-                            case 0x08: cname = "EAX"; break;
-                            case 0x09: cname = "EAX'"; break;
-                            default:   cname = "Unknown"; break;
+                            case 0x08:
+                                cname = "EAX";
+                                break;
+                            case 0x09:
+                                cname = "EAX'";
+                                break;
+                            default:
+                                cname = "Unknown";
+                                break;
                         }
                         PrintAndLogEx(INFO, "  Crypto Suite       : " _YELLOW_("%s") " ( %s )", sprint_hex_inrow(ival, ilen), cname);
                     }
@@ -5122,7 +5316,7 @@ void printIclassDumpContents(uint8_t *iclass_dump, uint8_t startblock, uint8_t e
     bool is_legacy, is_se, is_sr;
     uint8_t *sio_start;
     size_t sio_length;
-    detect_credential(iclass_dump, endblock * 8, &is_legacy, &is_se, &is_sr, &sio_start, &sio_length);
+    detect_credential(iclass_dump, filesize, &is_legacy, &is_se, &is_sr, &sio_start, &sio_length);
 
     bool is_legacy_decrypted = is_legacy && (iclass_dump[(6 * PICOPASS_BLOCK_SIZE) + 7] & 0x03) == 0x00;
 
@@ -5214,7 +5408,7 @@ void printIclassDumpContents(uint8_t *iclass_dump, uint8_t startblock, uint8_t e
                              );
             } else if (sio_start_block != 0 && i >= sio_start_block && i <= sio_end_block) {
                 // SIO credential
-                PrintAndLogEx(INFO, "%3d/0x%02X | " _CYAN_("%s") "| " _CYAN_("%s") " | %s | User / SIO / %s"
+                PrintAndLogEx(INFO, "%3d/0x%02X | " _CYAN_("%s") "| " _CYAN_("%s") " | %s | SIO / %s"
                               , i
                               , i
                               , sprint_hex(blk, 8)
@@ -5950,7 +6144,7 @@ void picopass_elite_nextKey(uint8_t *key) {
     memcpy(key, key_state, PICOPASS_BLOCK_SIZE);
 }
 
-static int iclass_recover(uint8_t key[8], uint32_t index_start, uint32_t loop, uint8_t no_first_auth[8], bool debug, bool test, bool fast, bool short_delay, bool allnight, bool credit) {
+static int iclass_recover(uint8_t key[8], uint32_t index_start, uint32_t loop, uint8_t no_first_auth[8], bool debug, bool test, bool fast, bool short_delay, bool allnight) {
 
     int runs = 1;
     int cycle = 1;
@@ -5962,7 +6156,7 @@ static int iclass_recover(uint8_t key[8], uint32_t index_start, uint32_t loop, u
     while (repeat == true) {
 
         uint32_t payload_size = sizeof(iclass_recover_req_t);
-        
+
         iclass_recover_req_t *payload = calloc(1, payload_size);
         if (payload == NULL) {
             PrintAndLogEx(WARNING, "Failed to allocate memory");
@@ -5982,7 +6176,6 @@ static int iclass_recover(uint8_t key[8], uint32_t index_start, uint32_t loop, u
         payload->test = test;
         payload->fast = fast;
         payload->short_delay = short_delay;
-        payload->credit_recovery = credit;
         memcpy(payload->nfa, no_first_auth, PICOPASS_BLOCK_SIZE);
         memcpy(payload->req.key, key, PICOPASS_BLOCK_SIZE);
 
@@ -6048,76 +6241,201 @@ void generate_key_block_inverted(const uint8_t *startingKey, uint64_t index, uin
 typedef struct {
     uint8_t startingKey[8];
     uint64_t index_start;
+    uint64_t index_end;
     uint8_t CCNR1[12];
     uint8_t MAC_TAG1[4];
     uint8_t CCNR2[12];
     uint8_t MAC_TAG2[4];
     int thread_id;
     int thread_count;
-    volatile bool *found;
+    uint64_t start_time;
+    _Atomic bool *found;
+    _Atomic bool *aborted;
+    _Atomic uint64_t *aborted_at;
+    bool debug;
     pthread_mutex_t *log_lock;
 } thread_args_t;
+
+// Lock-guarded "found" announcement; factored out because the bitslice and
+// scalar paths both reach it.
+static void legbrute_announce(thread_args_t *args, const uint8_t div_key[8]) {
+    pthread_mutex_lock(args->log_lock);
+    if (!*(args->found)) {
+        *args->found = true;
+        PrintAndLogEx(NORMAL, "\n");
+        PrintAndLogEx(SUCCESS, "Found valid raw key " _GREEN_("%s"), sprint_hex_inrow(div_key, 8));
+        PrintAndLogEx(HINT, "Hint: Run `"_YELLOW_("hf iclass unhash -k %s")"` to find the needed pre-images", sprint_hex_inrow(div_key, 8));
+        PrintAndLogEx(INFO, "Done!");
+        PrintAndLogEx(NORMAL, "");
+    }
+    pthread_mutex_unlock(args->log_lock);
+}
 
 // HF iClass legbrute - Brute-force worker thread
 static void *brute_thread(void *args_void) {
 
     thread_args_t *args = (thread_args_t *)args_void;
     uint8_t div_key[8];
-    uint8_t mac[4];
-    uint8_t verification_mac[4];
     uint64_t index = args->index_start;
 
-    while (!*(args->found)) {
+    // Scalar per-candidate hot-loop expansions (used in the alignment
+    // prefix/tail and for MAC2 verification after a bitslice hit).
+    uint8_t y_bits1[96];
+    uint8_t y_bits2[96];
+    prepare_ccnr_bits(args->CCNR1, y_bits1);
+    prepare_ccnr_bits(args->CCNR2, y_bits2);
 
-        generate_key_block_inverted(args->startingKey, index, div_key);
-        doMAC(args->CCNR1, div_key, mac);
+    // Bitslice expansions for the fast path. The backend is picked once at
+    // startup (widest SIMD width the CPU supports: AVX-512 > AVX2 > NEON > u64).
+    // MAC2 stays scalar — it only runs on the vanishingly rare MAC1 collisions,
+    // so there is no reason to pre-expand it.
+    const bs_backend_t *bs = bs_best_backend();
+    const uint64_t bs_align = (uint64_t)(bs->width - 1);
+    uint64_t y_bits1_bs[96 * BS_MAX_WORDS];
+    uint64_t target_mac1_bs[32 * BS_MAX_WORDS];
+    bs->prepare_ccnr(args->CCNR1, y_bits1_bs);
+    bs->prepare_mac(args->MAC_TAG1, target_mac1_bs);
 
-        if (memcmp(mac, args->MAC_TAG1, 4) == 0) {
-            doMAC(args->CCNR2, div_key, verification_mac);
-            if (memcmp(verification_mac, args->MAC_TAG2, 4) == 0) {
-                pthread_mutex_lock(args->log_lock);
-                if (!*(args->found)) {
-                    *args->found = true;
-                    PrintAndLogEx(NORMAL, "\n");
-                    PrintAndLogEx(SUCCESS, "Found valid raw key " _GREEN_("%s"), sprint_hex_inrow(div_key, 8));
-                    PrintAndLogEx(HINT, "Hint: Run `"_YELLOW_("hf iclass unhash -k %s")"` to find the needed pre-images", sprint_hex_inrow(div_key, 8));
-                    PrintAndLogEx(INFO, "Done!");
-                    PrintAndLogEx(NORMAL, "");
-                }
-                pthread_mutex_unlock(args->log_lock);
-                break;
-            }
+    if (args->debug) {
+        pthread_mutex_lock(args->log_lock);
+
+        PrintAndLogEx(INFO, "Thread[%2d]  range [%" PRIu64 " - %" PRIu64 ")  startingKey: %s"
+                      , args->thread_id
+                      , args->index_start
+                      , args->index_end
+                      , sprint_hex_inrow(args->startingKey, 8));
+
+        // Show first 2 candidates — different threads must start from different candidates
+        for (int d = 0; d < 2; d++) {
+            generate_key_block_inverted(args->startingKey, args->index_start + d, div_key);
+            PrintAndLogEx(INFO, "  [index %" PRIu64 "]: %s", args->index_start + d, sprint_hex_inrow(div_key, 8));
         }
 
-        if (index % 1000000 == 0 && !*(args->found)) {
+        // Show the midpoint of the slice — confirms byte-0 carry is reached inside this thread's range
+        uint64_t mid = args->index_start + (args->index_end - args->index_start) / 2;
+        generate_key_block_inverted(args->startingKey, mid, div_key);
+        PrintAndLogEx(INFO, "  [index %" PRIu64 " (mid)]: %s", mid, sprint_hex_inrow(div_key, 8));
+
+        pthread_mutex_unlock(args->log_lock);
+        return NULL;
+    }
+
+    uint32_t progress_countdown = 1000000;
+    while (index < args->index_end && !*(args->found) && !*(args->aborted)) {
+
+        uint64_t step;
+        const uint64_t remaining = args->index_end - index;
+
+        if ((index & bs_align) == 0 && remaining >= (uint64_t)bs->width) {
+            // Fast path: bs->width-wide bitslice MAC1 sweep. Build the key
+            // schedule for W consecutive candidates and test them in parallel.
+            uint64_t kb[64 * BS_MAX_WORDS];
+            bs->build_key(args->startingKey, index, kb);
+
+            uint64_t match[BS_MAX_WORDS];
+            bs->match(y_bits1_bs, kb, target_mac1_bs, match);
+
+            // MAC1 collisions are ~W / 2^32 per batch on average (i.e., zero
+            // until the true key's batch is reached). For each surviving lane,
+            // reconstruct its div_key and verify against MAC2 with the scalar
+            // prebit matcher.
+            bool done = false;
+            for (int w = 0; w < bs->words && !done; w++) {
+                uint64_t m = match[w];
+                while (m != 0) {
+                    const int L = __builtin_ctzll(m);
+                    m &= m - 1;
+                    const uint64_t cand = index + (uint64_t)(w * 64 + L);
+                    generate_key_block_inverted(args->startingKey, cand, div_key);
+                    if (doMAC_brute_match_prebit(y_bits2, div_key, args->MAC_TAG2)) {
+                        legbrute_announce(args, div_key);
+                        done = true;
+                        break;
+                    }
+                }
+            }
+
+            step = (uint64_t)bs->width;
+        } else {
+            // Scalar fallback: non-64-aligned prefix, the sub-64-candidate
+            // tail, or any thread whose slice is not a multiple of 64.
+            generate_key_block_inverted(args->startingKey, index, div_key);
+
+            if (doMAC_brute_match_prebit(y_bits1, div_key, args->MAC_TAG1)) {
+                if (doMAC_brute_match_prebit(y_bits2, div_key, args->MAC_TAG2)) {
+                    legbrute_announce(args, div_key);
+                }
+            }
+
+            step = 1;
+        }
+
+        uint64_t thread_progress = index - args->index_start;
+        if (progress_countdown <= step && !*(args->found)) {
+            progress_countdown = 100000000;
 
             if (args->thread_id == 0) {
+                uint64_t keyspace     = (uint64_t)1 << 40;
+                uint64_t keyspace_m   = keyspace / 1000000;      // 1,099,511
+                uint64_t run_progress = thread_progress * (uint64_t)args->thread_count;
+                // Cumulative absolute position across all threads including any --index offset
+                uint64_t abs_done     = args->index_start * (uint64_t)args->thread_count + run_progress;
+                uint64_t keys_left    = (abs_done < keyspace) ? keyspace - abs_done : 0;
+                uint64_t elapsed_ms   = msclock() - args->start_time;
+
                 pthread_mutex_lock(args->log_lock);
-                PrintAndLogEx(INPLACE, "Tested "_YELLOW_("%" PRIu64)" million keys, curr index: "_YELLOW_("%" PRIu64)", Thread[0]: %s"
-                              , ((index / 1000000) * args->thread_count)
-                              , (index / 1000000)
-                              , sprint_hex_inrow(div_key, 8)
-                             );
+
+                if (elapsed_ms > 0 && run_progress > 0) {
+                    // speed based on keys tested in this run only
+                    uint64_t kps   = run_progress * 1000 / elapsed_ms;
+                    uint64_t eta_s = (kps > 0) ? keys_left / kps : 0;
+                    uint64_t eta_d = eta_s / 86400;
+                    uint64_t eta_h = (eta_s % 86400) / 3600;
+                    uint64_t eta_m = (eta_s % 3600) / 60;
+                    uint64_t eta_r = eta_s % 60;
+                    PrintAndLogEx(INPLACE, "Tested "_YELLOW_("%" PRIu64)"M / %" PRIu64 "M keys  speed: "_YELLOW_("%" PRIu64)" k/s  ETA: "_YELLOW_("%" PRIu64 "d %02" PRIu64 "h %02" PRIu64 "m %02" PRIu64 "s")
+                                  , abs_done / 1000000
+                                  , keyspace_m
+                                  , kps / 1000
+                                  , eta_d, eta_h, eta_m, eta_r
+                                 );
+                } else {
+                    PrintAndLogEx(INPLACE, "Tested "_YELLOW_("%" PRIu64)"M / %" PRIu64 "M keys"
+                                  , abs_done / 1000000
+                                  , keyspace_m
+                                 );
+                }
+
+                if (kbd_enter_pressed()) {
+                    *args->aborted_at = index;
+                    *args->aborted = true;
+                }
                 pthread_mutex_unlock(args->log_lock);
             }
 
+        } else {
+            progress_countdown -= (uint32_t)step;
         }
-        index++;
+        index += step;
     }
     return NULL;
 }
 
 // HF iClass legbrute - Multithreaded brute-force function
-static int CmdHFiClassLegBrute_MT(uint8_t epurse[8], uint8_t macs[8], uint8_t macs2[8], uint8_t startingKey[8], uint64_t index, int threads) {
+static int CmdHFiClassLegBrute_MT(uint8_t epurse[8], uint8_t macs[8], uint8_t macs2[8], uint8_t startingKey[8], uint64_t index, int threads, bool debug) {
 
     int thread_count = threads;
     if (thread_count < 1) {
         thread_count = 1;
     }
-    if (thread_count > 16) {
-        thread_count = 16;
+    int max_threads = num_CPUs();
+    if (thread_count > max_threads) {
+        PrintAndLogEx(INFO, "Capping threads at available CPU count (%d)", max_threads);
+        thread_count = max_threads;
     }
-    PrintAndLogEx(INFO, "Bruteforcing using " _YELLOW_("%u") " threads", thread_count);
+    const bs_backend_t *bs = bs_best_backend();
+    PrintAndLogEx(INFO, "Bruteforcing using " _YELLOW_("%u") " threads, " _YELLOW_("%s") " bitslice (%d lanes)",
+                  thread_count, bs->name, bs->width);
     PrintAndLogEx(NORMAL, "");
 
     uint8_t CCNR[12], CCNR2[12], MAC_TAG[4], MAC_TAG2[4];
@@ -6131,25 +6449,49 @@ static int CmdHFiClassLegBrute_MT(uint8_t epurse[8], uint8_t macs[8], uint8_t ma
 
     pthread_t tids[thread_count];
     thread_args_t args[thread_count];
-    volatile bool found = false;
+    _Atomic bool found = false;
+    _Atomic bool aborted = false;
+    _Atomic uint64_t aborted_at = 0;
     pthread_mutex_t log_lock;
     pthread_mutex_init(&log_lock, NULL);
 
-    int nibble_range = 16 / thread_count;
+    PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to abort");
+
+    // Divide the full 40-bit keyspace into equal non-overlapping slices, one per thread.
+    // All threads use the same startingKey; only their index range differs.
+    uint64_t keyspace = (uint64_t)1 << 40;
+    uint64_t slice = keyspace / thread_count;
+    uint64_t start_time = msclock();
+
     for (int i = 0; i < thread_count; i++) {
         memcpy(args[i].startingKey, startingKey, 8);
-        args[i].startingKey[0] = (startingKey[0] & 0x0F) | ((i * nibble_range) << 4);
-        args[i].index_start = index;
+        args[i].index_start = index + (uint64_t)i * slice;
+        args[i].index_end   = (i == thread_count - 1)
+                              ? index + keyspace                      // last thread absorbs remainder
+                              : index + (uint64_t)(i + 1) * slice;
         memcpy(args[i].CCNR1, CCNR, 12);
         memcpy(args[i].MAC_TAG1, MAC_TAG, 4);
         memcpy(args[i].CCNR2, CCNR2, 12);
         memcpy(args[i].MAC_TAG2, MAC_TAG2, 4);
         args[i].thread_id = i;
         args[i].thread_count = thread_count;
+        args[i].start_time = start_time;
         args[i].found = &found;
+        args[i].aborted = &aborted;
+        args[i].aborted_at = &aborted_at;
+        args[i].debug = debug;
         args[i].log_lock = &log_lock;
 
-        pthread_create(&tids[i], NULL, brute_thread, &args[i]);
+        if (pthread_create(&tids[i], NULL, brute_thread, &args[i]) != 0) {
+            PrintAndLogEx(WARNING, "Failed to create thread %d, running with %d thread(s)", i, i);
+            thread_count = i;
+            break;
+        }
+    }
+
+    if (thread_count == 0) {
+        pthread_mutex_destroy(&log_lock);
+        return PM3_ESOFT;
     }
 
     for (int i = 0; i < thread_count; i++) {
@@ -6157,7 +6499,43 @@ static int CmdHFiClassLegBrute_MT(uint8_t epurse[8], uint8_t macs[8], uint8_t ma
     }
     pthread_mutex_destroy(&log_lock);
 
-    return found ? PM3_SUCCESS : ERR;
+    if (debug) {
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(INFO, "Index range summary (%d threads, keyspace 2^40 = %" PRIu64 "):", thread_count, (uint64_t)1 << 40);
+        PrintAndLogEx(INFO, "  Thread  start                end                  slice size");
+        for (int i = 0; i < thread_count; i++) {
+            PrintAndLogEx(INFO, "  [%2d]    %-20" PRIu64 " %-20" PRIu64 " %" PRIu64
+                          , i
+                          , args[i].index_start
+                          , args[i].index_end
+                          , args[i].index_end - args[i].index_start);
+        }
+        // Verify ranges are contiguous and non-overlapping
+        bool ok = true;
+        for (int i = 1; i < thread_count; i++) {
+            if (args[i].index_start != args[i - 1].index_end) {
+                PrintAndLogEx(WARNING, _RED_("  Gap or overlap between thread %d and %d!"), i - 1, i);
+                ok = false;
+            }
+        }
+        if (ok) {
+            PrintAndLogEx(SUCCESS, _GREEN_("  Ranges are contiguous and non-overlapping"));
+        }
+        return PM3_SUCCESS;
+    }
+
+    if (aborted) {
+        uint64_t resume_millions = aborted_at / 1000000;
+        PrintAndLogEx(WARNING, "\naborted via keyboard!");
+        PrintAndLogEx(HINT, "Hint: resume with " _YELLOW_("--index %" PRIu64 " --threads %d"), resume_millions, thread_count);
+        return PM3_EOPABORTED;
+    }
+
+    if (found == false) {
+        PrintAndLogEx(WARNING, "Key not found in the given keyspace");
+    }
+
+    return found ? PM3_SUCCESS : PM3_ESOFT;
 }
 
 // CmdHFiClassLegBrute function with CLI and multithreading support
@@ -6165,9 +6543,8 @@ static int CmdHFiClassLegBrute(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf iclass legbrute",
                   "This command takes sniffed trace data and a partial raw key and bruteforces the remaining 40 bits of the raw key.\n"
-                  "Complete 40 bit keyspace is 1'099'511'627'776 and command is locked down to max 16 threads currently.\n"
-                  "A possible worst case scenario on 16 threads estimates XXX days YYY hours MMM minutes.",
-                  "hf iclass legbrute --epurse feffffffffffffff --macs1 1306cad9b6c24466 --macs2 f0bf905e35f97923 --pk B4F12AADC5301225");
+                  "Complete 40 bit keyspace is 1'099'511'627'776.",
+                  "hf iclass legbrute --epurse feffffffffffffff --macs1 1306cad9b6c24466 --macs2 f0bf905e35f97923 --pk 0401020505000205");
 
     void *argtable[] = {
         arg_param_begin,
@@ -6176,7 +6553,8 @@ static int CmdHFiClassLegBrute(const char *Cmd) {
         arg_str1(NULL, "macs2", "<hex>", "MACs captured from the reader, different than the first set (with the same csn and epurse value)"),
         arg_str1(NULL, "pk", "<hex>", "Partial Key from legrec or starting key of keyblock from legbrute"),
         arg_int0(NULL, "index", "<dec>", "Where to start from to retrieve the key, default 0 - value in millions e.g. 1 is 1 million"),
-        arg_int0(NULL, "threads", "<dec>", "Number of threads to use, by default it uses the cpu's max threads (max 16)."),
+        arg_int0(NULL, "threads", "<dec>", "Number of threads to use, by default it uses the cpu's max threads."),
+        arg_lit0(NULL, "dbg",    "Print first 2 key candidates and midpoint per thread, then exit (use to verify thread partitioning)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -6200,6 +6578,7 @@ static int CmdHFiClassLegBrute(const char *Cmd) {
     uint64_t index = arg_get_int_def(ctx, 5, 0);
     index *= 1000000;
     int threads = arg_get_int_def(ctx, 6, num_CPUs());
+    bool debug = arg_get_lit(ctx, 7);
     CLIParserFree(ctx);
 
     if (epurse_len && epurse_len != PICOPASS_BLOCK_SIZE) {
@@ -6222,7 +6601,7 @@ static int CmdHFiClassLegBrute(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    return CmdHFiClassLegBrute_MT(epurse, macs, macs2, startingKey, index, threads);
+    return CmdHFiClassLegBrute_MT(epurse, macs, macs2, startingKey, index, threads, debug);
 }
 
 static void generate_single_key_block_inverted_opt(const uint8_t *startingKey, uint32_t index, uint8_t *keyBlock) {
@@ -6265,7 +6644,7 @@ static void generate_single_key_block_inverted_opt(const uint8_t *startingKey, u
 
 }
 
-static int CmdHFiClassLegacyRecSim(bool credit) {
+static int CmdHFiClassLegacyRecSim(void) {
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, _YELLOW_("This simulation assumes the card is standard keyed."));
@@ -6280,11 +6659,7 @@ static int CmdHFiClassLegacyRecSim(bool credit) {
     }
 
     uint8_t new_div_key[8] = {0};
-    if (credit == true) {
-        HFiClassCalcDivKey(csn, iClass_Key_Table[1], new_div_key, false);
-    } else {
-        HFiClassCalcDivKey(csn, iClass_Key_Table[0], new_div_key, false);
-    }
+    HFiClassCalcDivKey(csn, iClass_Key_Table[0], new_div_key, false);
 
     uint8_t key[PICOPASS_BLOCK_SIZE] = {0};
     uint8_t original_key[PICOPASS_BLOCK_SIZE] = {0};
@@ -6344,7 +6719,7 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf iclass legrec",
                   "Attempts to recover the diversified key of a specific iCLASS card. This may take several days.\n"
-                  "The card must remain be on the PM3 antenna during the whole process.\n"
+                  "The card must remain on the PM3 antenna during the whole process.\n"
                   _RED_(" ! Warning ! ") _WHITE_(" This process may brick the card! ") _RED_(" ! Warning ! "),
                   "hf iclass legrec --macs 0000000089cb984b\n"
                   "hf iclass legrec --macs 0000000089cb984b --index 0 --loop 100 --notest"
@@ -6352,7 +6727,7 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
 
     void *argtable[] = {
         arg_param_begin,
-        arg_str1(NULL, "macs", "<hex>", "AA1 Authentication MACs"),
+        arg_str0(NULL, "macs", "<hex>", "AA1 Authentication MACs"),
         arg_int0(NULL, "index", "<dec>", "Where to start from to retrieve the key (def: 0)"),
         arg_int0(NULL, "loop", "<dec>", "The number of key retrieval cycles to perform, max 10000 (def 100)"),
         arg_lit0(NULL, "debug", "Re-enables tracing for debugging. Limits cycles to 1"),
@@ -6361,7 +6736,6 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
         arg_lit0(NULL, "fast", "Increases the speed (4.6->7.4 key updates/second), higher risk to brick the card"),
         arg_lit0(NULL, "sl", "Lower card comms delay times, further speeds increases, may cause more errors"),
         arg_lit0(NULL, "est", "Estimates the key updates based on the card's CSN assuming standard key, can be used with --credit option"),
-        arg_lit0(NULL, "credit", "EXPERIMENTAL : Recover the credit key using KD 0"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -6379,11 +6753,16 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
     bool fast = arg_get_lit(ctx, 7);
     bool short_delay = arg_get_lit(ctx, 8);
     bool sim = arg_get_lit(ctx, 9);
-    bool credit = arg_get_lit(ctx, 10);
 
     if (sim) {
-        CmdHFiClassLegacyRecSim(credit);
+        CmdHFiClassLegacyRecSim();
         return PM3_SUCCESS;
+    }
+
+    if (macs_len == 0) {
+        PrintAndLogEx(ERR, "Missing required argument: --macs");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
     }
 
     if (no_test) {
@@ -6412,12 +6791,7 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
         return PM3_ESOFT;
     }
 
-    if (credit == true) {
-        diversifyKey(csn, iClass_Key_Table[0], new_div_key);
-        fast = false;
-    } else {
-        diversifyKey(csn, iClass_Key_Table[1], new_div_key);
-    }
+    diversifyKey(csn, iClass_Key_Table[1], new_div_key);
 
     memcpy(no_first_auth, new_div_key, PICOPASS_BLOCK_SIZE);
 
@@ -6432,10 +6806,12 @@ static int CmdHFiClassLegacyRecover(const char *Cmd) {
     PrintAndLogEx(INFO, "---------------------------------------");
     PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " to abort");
     PrintAndLogEx(INFO, "--------------- " _CYAN_("start") " -----------------\n");
-    iclass_recover(macs, index, loop, no_first_auth, debug, test, fast, short_delay, allnight, credit);
+    iclass_recover(macs, index, loop, no_first_auth, debug, test, fast, short_delay, allnight);
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(WARNING, _YELLOW_("If the process completed successfully"));
-    PrintAndLogEx(HINT, "Hint: run `" _YELLOW_("hf iclass legbrute -h") "` with the partial key found");
+    PrintAndLogEx(HINT, "Hint-1: run `" _YELLOW_("hf iclass legbrute -h") "` with the partial key found");
+    PrintAndLogEx(HINT, "Hint-2: alternatively run hashcat `" _YELLOW_("./hashcat -a 3 -m 64000 hash.txt ?b?b?b?b?b") "` with the partial key found");
+    PrintAndLogEx(HINT, "hash.txt format would be: `" _YELLOW_("$iclass_leg$partial_key$ccnr1$mac1$ccnr2$mac2") "`");
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 
@@ -7050,13 +7426,14 @@ static void generate(uint8_t *data, uint8_t len) {
         PrintAndLogEx(WARNING, "Failed to allocate memory");
         return;
     }
-    
+
     uint8_t *pkey = calloc(len, sizeof(uint8_t));
     if (pkey == NULL) {
         PrintAndLogEx(WARNING, "Failed to allocate memory");
+        free(key);
         return;
     }
-    
+
     PrintAndLogEx(SUCCESS, "input key...... %s", sprint_hex_inrow(data, len));
     permute(data, len, pkey);
     PrintAndLogEx(SUCCESS, "permuted key... %s", sprint_hex_inrow(pkey, len));
@@ -7114,9 +7491,11 @@ static int CmdHFiClassEncode(const char *Cmd) {
     CLIParserInit(&ctx, "hf iclass encode",
                   "Encode binary wiegand to block 7,8,9\n"
                   "Use either --bin or --wiegand/--fc/--cn\n"
+                  "Authenticate with either --ki (key slot index) or -k/--key (raw 8-byte hex key)\n"
                   "When using emulator you have to first load a credential into emulator memory",
                   "hf iclass encode --bin 10001111100000001010100011 --ki 0            -> FC 31 CN 337 (H10301)\n"
                   "hf iclass encode -w H10301 --fc 31 --cn 337 --ki 0                  -> FC 31 CN 337 (H10301)\n"
+                  "hf iclass encode -w H10301 --fc 31 --cn 337 -k 0102030405060708     -> authenticate with  hex key\n"
                   "hf iclass encode --bin 10001111100000001010100011 --ki 0 --elite    -> FC 31 CN 337 (H10301), writing w elite key\n"
                   "hf iclass encode -w H10301 --fc 31 --cn 337 --emu                   -> Writes the ecoded data to emulator memory"
                  );
@@ -7125,6 +7504,7 @@ static int CmdHFiClassEncode(const char *Cmd) {
         arg_param_begin,
         arg_str0(NULL, "bin", "<bin>", "Binary string i.e 0001001001"),
         arg_int0(NULL, "ki", "<dec>", "Key index to select key from memory 'hf iclass managekeys'"),
+        arg_str0("k",  "key", "<hex>", "Key as 8 hex bytes (alternative to --ki)"),
         arg_lit0(NULL, "credit", "key is assumed to be the credit key"),
         arg_lit0(NULL, "elite", "elite computations applied to key"),
         arg_lit0(NULL, "raw", "no computations applied to key"),
@@ -7136,6 +7516,7 @@ static int CmdHFiClassEncode(const char *Cmd) {
         arg_lit0(NULL, "emu", "Write to emulation memory instead of card"),
         arg_lit0(NULL, "shallow", "use shallow (ASK) reader modulation instead of OOK"),
         arg_lit0("v", NULL, "verbose (print encoded blocks)"),
+        arg_str0(NULL, "enc", "[none|des|2k3des]", "transport encryption mode"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -7146,19 +7527,41 @@ static int CmdHFiClassEncode(const char *Cmd) {
     CLIGetStrWithReturn(ctx, 1, bin, &bin_len);
 
     int key_nr = arg_get_int_def(ctx, 2, -1);
-    bool use_emulator_memory = arg_get_lit(ctx, 11);
+
+    int raw_key_len = 0;
+    uint8_t raw_key[8] = {0};
+    CLIGetHexWithReturn(ctx, 3, raw_key, &raw_key_len);
+
+    bool use_emulator_memory = arg_get_lit(ctx, 12);
 
     bool auth = false;
     uint8_t key[8] = {0};
 
+    if (key_nr >= 0 && raw_key_len > 0) {
+        PrintAndLogEx(ERR, "Use either --ki or -k/--key, not both");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    if (raw_key_len > 0 && raw_key_len != 8) {
+        PrintAndLogEx(ERR, "Raw key must be 8 bytes (got %d)", raw_key_len);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
     // If we use emulator memory skip key requirement
     if (use_emulator_memory == false) {
-        if (key_nr < 0) {
-            PrintAndLogEx(ERR, "Missing required arg for --ki or --emu");
+        if (key_nr < 0 && raw_key_len == 0) {
+            PrintAndLogEx(ERR, "Missing required arg for --ki, -k/--key or --emu");
+            CLIParserFree(ctx);
             return PM3_EINVARG;
         }
 
-        if (key_nr >= 0) {
+        if (raw_key_len == 8) {
+            auth = true;
+            memcpy(key, raw_key, 8);
+            PrintAndLogEx(SUCCESS, "Using raw key " _GREEN_("%s"), sprint_hex(key, 8));
+        } else if (key_nr >= 0) {
             if (key_nr < ICLASS_KEYS_MAX) {
                 auth = true;
                 memcpy(key, iClass_Key_Table[key_nr], 8);
@@ -7171,32 +7574,37 @@ static int CmdHFiClassEncode(const char *Cmd) {
         }
     }
 
-    bool use_credit_key = arg_get_lit(ctx, 3);
-    bool elite = arg_get_lit(ctx, 4);
-    bool rawkey = arg_get_lit(ctx, 5);
+    bool use_credit_key = arg_get_lit(ctx, 4);
+    bool elite = arg_get_lit(ctx, 5);
+    bool rawkey = arg_get_lit(ctx, 6);
 
     int enc_key_len = 0;
     uint8_t enc_key[16] = {0};
     uint8_t *enckeyptr = NULL;
     bool have_enc_key = false;
     bool use_sc = false;
-    CLIGetHexWithReturn(ctx, 6, enc_key, &enc_key_len);
+    CLIGetHexWithReturn(ctx, 7, enc_key, &enc_key_len);
 
     // FC / CN / Issue Level
     wiegand_card_t card;
     memset(&card, 0, sizeof(wiegand_card_t));
 
-    card.FacilityCode = arg_get_u32_def(ctx, 7, 0);
-    card.CardNumber = arg_get_u32_def(ctx, 8, 0);
-    card.IssueLevel = arg_get_u32_def(ctx, 9, 0);
+    card.FacilityCode = arg_get_u32_def(ctx, 8, 0);
+    card.CardNumber = arg_get_u32_def(ctx, 9, 0);
+    card.IssueLevel = arg_get_u32_def(ctx, 10, 0);
 
     char format[16] = {0};
     int format_len = 0;
 
-    CLIParamStrToBuf(arg_get_str(ctx, 10), (uint8_t *)format, sizeof(format), &format_len);
+    CLIParamStrToBuf(arg_get_str(ctx, 11), (uint8_t *)format, sizeof(format), &format_len);
 
-    bool shallow_mod = arg_get_lit(ctx, 12);
-    bool verbose = arg_get_lit(ctx, 13);
+    bool shallow_mod = arg_get_lit(ctx, 13);
+    bool verbose = arg_get_lit(ctx, 14);
+    int transport_mode = TRIPLEDES;
+    if (CLIGetOptionList(arg_get_str(ctx, 15), IClassEncodeEncryptionOpts, &transport_mode)) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
 
     CLIParserFree(ctx);
 
@@ -7213,6 +7621,10 @@ static int CmdHFiClassEncode(const char *Cmd) {
         have_enc_key = true;
     }
 
+    if (transport_mode == None && enc_key_len != 0) {
+        PrintAndLogEx(WARNING, "Transport mode marker is none; --enckey will be ignored.");
+    }
+
     if (bin_len > 64) {
         PrintAndLogEx(ERR, "Binary wiegand string must be less than 64 bits");
         return PM3_EINVARG;
@@ -7223,9 +7635,9 @@ static int CmdHFiClassEncode(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    if (have_enc_key == false) {
+    if (transport_mode != None && have_enc_key == false) {
         // The IsCardHelperPresent function clears the emulator memory
-        if (use_emulator_memory) {
+        if (use_emulator_memory || transport_mode != TRIPLEDES) {
             use_sc = false;
         } else {
             use_sc = IsCardHelperPresent(false);
@@ -7310,18 +7722,20 @@ static int CmdHFiClassEncode(const char *Cmd) {
         memcpy(credential + 12, &packed.Bot, sizeof(packed.Bot));
     }
 
-    // encrypt with transport key
-    if (use_sc) {
-        Encrypt(credential + 8, credential + 8);
-        Encrypt(credential + 16, credential + 16);
-        Encrypt(credential + 24, credential + 24);
-    } else {
-        iclass_encrypt_block_data(credential + 8, enc_key);
-        iclass_encrypt_block_data(credential + 16, enc_key);
-        iclass_encrypt_block_data(credential + 24, enc_key);
+    iclass_set_transport_mode(credential, (BLOCK79ENCRYPTION)transport_mode);
+    if (transport_mode != None) {
+        if (use_sc) {
+            Encrypt(credential + 8, credential + 8);
+            Encrypt(credential + 16, credential + 16);
+            Encrypt(credential + 24, credential + 24);
+        } else if (iclass_apply_transport_mode_to_credential(credential + 8, enc_key, (BLOCK79ENCRYPTION)transport_mode, true) != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to apply transport mode");
+            return PM3_EINVARG;
+        }
     }
 
     if (verbose) {
+        PrintAndLogEx(INFO, "Mode: %s", CLIGetOptionListStr(IClassEncodeEncryptionOpts, transport_mode));
         for (uint8_t i = 0; i < 4; i++) {
             PrintAndLogEx(INFO, "Block %d/0x0%x -> " _YELLOW_("%s"), 6 + i, 6 + i, sprint_hex_inrow(credential + (i * 8), 8));
         }
@@ -7456,6 +7870,10 @@ static int CmdHFiClassConfigCard(const char *Cmd) {
 
     if (ccidx > -1 && ccidx < ARRAYLEN(iclass_config_options)) {
         const iclass_config_card_item_t *item = get_config_card_item(ccidx);
+        if (strlen(item->desc) == 0) {
+            PrintAndLogEx(ERR, "out of range, %u (got %u)",  ARRAYLEN(iclass_config_options), ccidx);
+            return PM3_EINVARG;
+        }
         if (strstr(item->desc, "ELITE") != NULL && got_kr == false) {
             PrintAndLogEx(ERR, "please specify ELITE Key (--eki) !");
             return PM3_EINVARG;
@@ -7483,7 +7901,15 @@ static bool match_with_wildcard(const uint8_t *data, const uint8_t *pattern, con
     return true;
 }
 
-static int CmdHFiClassSAM(const char *Cmd) {
+
+// ---------------------------------------------------------------------------
+// Legacy "hf iclass sam" PACS-extraction implementation.
+//
+// Reached via the CmdHFiClassSAM dispatcher (below) when no SC subcommand
+// keyword is given - so `hf iclass sam`, `hf iclass sam --info`,
+// `hf iclass sam -p -d ...`, `hf iclass sam -f ...` etc. all land here.
+// ---------------------------------------------------------------------------
+static int CmdHFiClassSAMExtract(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf iclass sam",
                   "Extract PACS via a HID SAM\n",
@@ -7491,6 +7917,7 @@ static int CmdHFiClassSAM(const char *Cmd) {
                   "hf iclass sam -p -d a005a103800104  -> get PACS data, prevent epurse update\n"
                   "hf iclass sam --break               -> get Nr-MAC for extracting encrypted SIO\n"
                   "hf iclass sam -f hf-iclass-dump.bin -> emulate card from dump file to SAM\n"
+                  "hf iclass sam --info                -> get SAM version + serial (also warms up the SAM)\n"
                  );
 
     void *argtable[] = {
@@ -7686,6 +8113,1111 @@ static int CmdHFiClassSAM(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+// ===========================================================================
+// HID Artemis secure-channel session - persistent across CLI calls
+// ===========================================================================
+//
+// Sits on top of the new CMD_HF_SAM_SC firmware dispatcher (armsrc/sam_sc.c).
+// The firmware is just a transport pipe - host owns the SCP02 / Grace crypto
+// state (sEnc / sMAC1 / sMAC2 / rolling C-MAC + R-MAC) and the SAM-assigned
+// scFlag. State persists across CLI invocations in the static s_sam_sc.
+//
+// All bit patterns mirror UTILITIES_TOOLS/cp1000_client/secure_channel.py.
+
+// Mirror of armsrc/sam_sc.h - duplicated locally so the client doesn't have
+// to pull armsrc/ headers. Keep in sync if those flags ever change.
+#define SAM_SC_FLAG_FORCE_RESET (1 << 0)
+#define SAM_SC_FLAG_RELEASE     (1 << 1)
+#define SAM_SC_FLAG_NO_PAYLOAD  (1 << 2)
+
+// Mirror of armsrc/i2c.h::ISO7816_MAX_FRAME (270). Not exported to the
+// client; used as an upper bound for SC plaintext / wrap buffers.
+#define SAM_SC_MAX_FRAME 270
+
+// All-zero placeholder master key. Real master keys depend on the target
+// SAM's provisioning state and must be supplied with --key. Slot 0x85 is the
+// canonical HidUserAdmin slot index on CP1000-class encoders.
+static const uint8_t SAM_SC_DEFAULT_MASTER_KEY[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const uint8_t SAM_SC_DEFAULT_KREF = 0x85;
+
+typedef struct {
+    bool open;
+    uint8_t kref;
+    uint8_t master_key[16];
+    uint8_t suid[8];
+    uint8_t rnd_a[8];
+    uint8_t rnd_b[8];
+    uint8_t scbk[16];
+    uint8_t s_enc[16];
+    uint8_t s_mac1[16];
+    uint8_t s_mac2[16];
+    uint8_t c_mac[16];   // rolling client MAC (advanced by Wrap)
+    uint8_t r_mac[16];   // rolling server MAC (advanced by Unwrap)
+    uint8_t sc_flag;     // SAM-assigned secure-channel routing byte
+} sam_sc_session_t;
+
+static sam_sc_session_t s_sam_sc = {0};
+
+// HID's custom CBC-MAC variant. Zero-pad msg to a 16B multiple; AES-ECB
+// the first N-1 blocks with sMAC1, the last with sMAC2. Initial mac = iv.
+// Output is 16 bytes (no truncation). AES-ECB single block done via
+// aes_encode() with a zero CBC-IV.
+static void sam_sc_hid_mac(const uint8_t s_mac1[16], const uint8_t s_mac2[16],
+                           const uint8_t iv[16],
+                           const uint8_t *msg, size_t msg_len,
+                           uint8_t out[16]) {
+    uint8_t mac[16];
+    memcpy(mac, iv, 16);
+
+    if (msg_len == 0) msg_len = 16;
+    size_t pad = (16 - (msg_len % 16)) % 16;
+    size_t total = msg_len + pad;
+    size_t blocks = total / 16;
+
+    for (size_t i = 0; i < blocks; i++) {
+        uint8_t block[16];
+        size_t off = i * 16;
+        size_t copy = (off + 16 <= msg_len) ? 16 : (msg_len > off ? msg_len - off : 0);
+        if (copy > 0) memcpy(block, msg + off, copy);
+        if (copy < 16) memset(block + copy, 0x00, 16 - copy);
+
+        for (size_t j = 0; j < 16; j++) block[j] ^= mac[j];
+
+        uint8_t zero_iv[16] = {0}, key_copy[16];
+        memcpy(key_copy, (i + 1 == blocks) ? s_mac2 : s_mac1, 16);
+        aes_encode(zero_iv, key_copy, block, mac, 16);
+    }
+    memcpy(out, mac, 16);
+}
+
+// Send a payload via CMD_HF_SAM_SC. Returns SAM-assigned scFlag and the SAM
+// response bytes (BD/BE-prefixed) per the reply layout in armsrc/sam_sc.h.
+static int sam_sc_dispatch(uint8_t flags, uint8_t scflag_in,
+                           const uint8_t *payload, uint16_t payload_len,
+                           uint8_t *sc_flag_out, uint8_t *sam_resp,
+                           uint16_t *sam_resp_len) {
+    if (sc_flag_out == NULL || sam_resp == NULL || sam_resp_len == NULL)
+        return PM3_EINVARG;
+    if ((size_t)payload_len + 5 > PM3_CMD_DATA_SIZE)
+        return PM3_EINVARG;
+
+    uint8_t pkt[PM3_CMD_DATA_SIZE] = {0};
+    pkt[0] = flags;
+    pkt[1] = 0x44;   // ipcNodeIdExternalApplicationA (us)
+    pkt[2] = 0x0A;   // ipcNodeIdPrimarySam
+    pkt[3] = 0x44;   // reply-to = us
+    pkt[4] = scflag_in;
+    if (payload_len > 0)
+        memcpy(pkt + 5, payload, payload_len);
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_SAM_SC, pkt, payload_len + 5);
+
+    PacketResponseNG resp;
+    if (WaitForResponse(CMD_HF_SAM_SC, &resp) == false)
+        return PM3_ETIMEOUT;
+    if (resp.status != PM3_SUCCESS)
+        return resp.status;
+    if (resp.length < 1)
+        return PM3_ESOFT;
+
+    *sc_flag_out = resp.data.asBytes[0];
+    uint16_t body_len = (uint16_t)(resp.length - 1);
+    if (body_len > *sam_resp_len) body_len = *sam_resp_len;
+    if (body_len > 0) memcpy(sam_resp, resp.data.asBytes + 1, body_len);
+    *sam_resp_len = body_len;
+    return PM3_SUCCESS;
+}
+
+// Build the InitAuth SAM payload (23 bytes):
+//   A0 15 AF 13 80 01 <ver> 81 01 <kref> 82 08 <rnd_a> 83 01 <tca>
+static uint16_t sam_sc_build_init_auth(uint8_t kref, const uint8_t rnd_a[8],
+                                       uint8_t out[23]) {
+    out[0] = 0xA0;
+    out[1] = 0x15;
+    out[2] = 0xAF;
+    out[3] = 0x13;
+    out[4] = 0x80;
+    out[5] = 0x01;
+    out[6] = 0x00;        // version=0
+    out[7] = 0x81;
+    out[8] = 0x01;
+    out[9] = kref;
+    out[10] = 0x82;
+    out[11] = 0x08;
+    memcpy(out + 12, rnd_a, 8);
+    out[20] = 0x83;
+    out[21] = 0x01;
+    out[22] = 0x00;     // tca=0
+    return 23;
+}
+
+// Build the ContinueAuth SAM payload (40 bytes):
+//   A0 26 B0 24 80 10 <clientCryptogram> 81 10 <clientCmac>
+static uint16_t sam_sc_build_continue_auth(const uint8_t client_crypto[16],
+                                           const uint8_t client_cmac[16],
+                                           uint8_t out[40]) {
+    out[0] = 0xA0;
+    out[1] = 0x26;
+    out[2] = 0xB0;
+    out[3] = 0x24;
+    out[4] = 0x80;
+    out[5] = 0x10;
+    memcpy(out + 6, client_crypto, 16);
+    out[22] = 0x81;
+    out[23] = 0x10;
+    memcpy(out + 24, client_cmac, 16);
+    return 40;
+}
+
+// out = AES-CBC(scbk, IV=0, prefix(2) || rnd_b[0..2] || zeros[12])  (1 block).
+static void sam_sc_kdf_derive(const uint8_t scbk[16], const uint8_t prefix[2],
+                              const uint8_t rnd_b[8], uint8_t out[16]) {
+    uint8_t in[16];
+    in[0] = prefix[0];
+    in[1] = prefix[1];
+    in[2] = rnd_b[0];
+    in[3] = rnd_b[1];
+    memset(in + 4, 0, 12);
+    uint8_t iv[16] = {0}, key_copy[16];
+    memcpy(key_copy, scbk, 16);
+    aes_encode(iv, key_copy, in, out, 16);
+}
+
+// Wrap plaintext for transmission on the open SC. Returns wrapped length.
+//   padded     = plaintext || 0x80 || zeros (to next 16B)
+//   iv_enc     = ~r_mac
+//   ciphertext = AES-CBC(s_enc, iv_enc, padded)
+//   new_cmac   = HID-MAC(s_mac1, s_mac2, IV=r_mac, ciphertext)
+//   c_mac     <- new_cmac (R-MAC unchanged; only Unwrap advances it)
+//   return ciphertext || new_cmac
+static uint16_t sam_sc_wrap(const uint8_t *plaintext, uint16_t plaintext_len,
+                            uint8_t *out, uint16_t out_cap) {
+    if (s_sam_sc.open == false) return 0;
+    uint16_t padded_len = plaintext_len + 1;
+    if ((padded_len % 16) != 0) padded_len += 16 - (padded_len % 16);
+    if ((uint32_t)padded_len + 16 > out_cap) return 0;
+
+    uint8_t padded[SAM_SC_MAX_FRAME];
+    if (padded_len > sizeof(padded)) return 0;
+    if (plaintext_len > 0) memcpy(padded, plaintext, plaintext_len);
+    padded[plaintext_len] = 0x80;
+    if (padded_len > plaintext_len + 1)
+        memset(padded + plaintext_len + 1, 0x00, padded_len - plaintext_len - 1);
+
+    uint8_t iv_enc[16], key_copy[16];
+    for (int i = 0; i < 16; i++) iv_enc[i] = (uint8_t)(s_sam_sc.r_mac[i] ^ 0xFF);
+    memcpy(key_copy, s_sam_sc.s_enc, 16);
+    aes_encode(iv_enc, key_copy, padded, out, padded_len);
+
+    uint8_t new_cmac[16];
+    sam_sc_hid_mac(s_sam_sc.s_mac1, s_sam_sc.s_mac2, s_sam_sc.r_mac,
+                   out, padded_len, new_cmac);
+
+    memcpy(out + padded_len, new_cmac, 16);
+    memcpy(s_sam_sc.c_mac, new_cmac, 16);
+    return (uint16_t)(padded_len + 16);
+}
+
+// Unwrap ciphertext+MAC. Verifies MAC under c_mac, decrypts under sEnc with
+// iv=~c_mac, strips 0x80+zeros padding, advances r_mac. Returns plaintext
+// length on success, -1 on MAC mismatch or padding error.
+static int sam_sc_unwrap(const uint8_t *data, uint16_t data_len,
+                         uint8_t *plaintext_out, uint16_t out_cap) {
+    if (s_sam_sc.open == false) return -1;
+    if (data_len < 16) return -1;
+    uint16_t ct_len = data_len - 16;
+    const uint8_t *ciphertext = data;
+    const uint8_t *received_mac = data + ct_len;
+
+    uint8_t expected_mac[16];
+    sam_sc_hid_mac(s_sam_sc.s_mac1, s_sam_sc.s_mac2, s_sam_sc.c_mac,
+                   ciphertext, ct_len, expected_mac);
+    if (memcmp(expected_mac, received_mac, 16) != 0) return -1;
+
+    if (ct_len == 0) {
+        memcpy(s_sam_sc.r_mac, received_mac, 16);
+        return 0;
+    }
+    if (ct_len > out_cap) return -1;
+
+    uint8_t iv_dec[16], key_copy[16];
+    for (int i = 0; i < 16; i++) iv_dec[i] = (uint8_t)(s_sam_sc.c_mac[i] ^ 0xFF);
+    memcpy(key_copy, s_sam_sc.s_enc, 16);
+    aes_decode(iv_dec, key_copy, (uint8_t *)ciphertext, plaintext_out, ct_len);
+
+    int i = ct_len - 1;
+    while (i >= 0 && plaintext_out[i] == 0x00) i--;
+    if (i < 0 || plaintext_out[i] != 0x80) return -1;
+    int plaintext_len = i;
+
+    memcpy(s_sam_sc.r_mac, received_mac, 16);
+    return plaintext_len;
+}
+
+// Peel BD <len> 8A <len>  or  BD <len> B3 <len>  or  BE <len> envelopes.
+// Returns pointer to inner ciphertext+MAC bytes + its length. *path is set
+// to 'A', 'B', or 'C'. Returns 0 on success, -1 on shape error. Supports
+// short-form and long-form (0x81/0x82) BER lengths.
+static int sam_sc_peel_envelope(const uint8_t *resp, uint16_t resp_len,
+                                const uint8_t **inner, uint16_t *inner_len,
+                                char *path) {
+    if (resp_len < 2) return -1;
+
+#define SAM_SC_READ_BER_LEN(buf, buflen, off, out_len)                \
+        do {                                                              \
+            if ((off) >= (buflen)) return -1;                             \
+            uint8_t b0 = (buf)[(off)++];                                  \
+            if (b0 < 0x80) { (out_len) = b0; }                            \
+            else if (b0 == 0x81) {                                        \
+                if ((off) >= (buflen)) return -1;                         \
+                (out_len) = (buf)[(off)++];                               \
+            } else if (b0 == 0x82) {                                      \
+                if ((off) + 1 >= (buflen)) return -1;                     \
+                (out_len) = ((uint16_t)(buf)[(off)] << 8) | (buf)[(off)+1]; \
+                (off) += 2;                                               \
+            } else return -1;                                             \
+        } while (0)
+
+    uint16_t off = 0;
+    uint8_t outer_tag = resp[off++];
+    uint16_t outer_len;
+    SAM_SC_READ_BER_LEN(resp, resp_len, off, outer_len);
+    if ((uint32_t)off + outer_len > resp_len) return -1;
+
+    if (outer_tag == 0xBE) {
+        *path = 'C';
+        *inner = resp + off;
+        *inner_len = outer_len;
+        return 0;
+    }
+    if (outer_tag != 0xBD) return -1;
+
+    if (off >= resp_len) return -1;
+    uint8_t inner_tag = resp[off++];
+    uint16_t in_len;
+    SAM_SC_READ_BER_LEN(resp, resp_len, off, in_len);
+    if ((uint32_t)off + in_len > resp_len) return -1;
+
+    if (inner_tag == 0x8A)      *path = 'A';
+    else if (inner_tag == 0xB3) *path = 'B';
+    else return -1;
+
+    *inner = resp + off;
+    *inner_len = in_len;
+    return 0;
+
+#undef SAM_SC_READ_BER_LEN
+}
+
+// Encode a BER length (short form < 128, otherwise 0x81/0x82).
+static uint8_t sam_sc_emit_ber_len(uint8_t *out, uint16_t len) {
+    if (len < 0x80) { out[0] = (uint8_t)len; return 1; }
+    if (len < 0x100) { out[0] = 0x81; out[1] = (uint8_t)len; return 2; }
+    out[0] = 0x82;
+    out[1] = (uint8_t)(len >> 8);
+    out[2] = (uint8_t)(len & 0xFF);
+    return 3;
+}
+
+// ---------------------------------------------------------------------------
+// hf iclass sam scopen
+// ---------------------------------------------------------------------------
+static int CmdHFiClassSAMSCOpen(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf iclass sam scopen",
+                  "Open a HID Artemis secure channel: InitAuth + ContinueAuth.\n"
+                  "Persists the session state across CLI commands so subsequent\n"
+                  "scsend / scclose operations can wrap/unwrap APDUs against\n"
+                  "the same SAM-side session.\n"
+                  "Defaults: --key 00000000000000000000000000000000 --kref 0x85",
+                  "hf iclass sam scopen --key 00000000000000000000000000000000\n");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, "key",  "<hex>", "16-byte AES master key (default: all zeros - override with real key)"),
+        arg_int0(NULL, "kref", "<dec>", "key reference slot 0..255 (default: 0x85)"),
+        arg_lit0("v",  "verbose", "verbose output"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    uint8_t master_key[16];
+    int key_len = 0;
+    if (CLIParamHexToBuf(arg_get_str(ctx, 1), master_key, sizeof(master_key), &key_len) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (key_len == 0) {
+        memcpy(master_key, SAM_SC_DEFAULT_MASTER_KEY, 16);
+    } else if (key_len != 16) {
+        PrintAndLogEx(FAILED, "--key must be exactly 16 bytes (32 hex chars), got %d", key_len);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    int kref = arg_get_int_def(ctx, 2, SAM_SC_DEFAULT_KREF);
+    bool verbose = arg_get_lit(ctx, 3);
+    CLIParserFree(ctx);
+
+    if (kref < 0 || kref > 0xFF) {
+        PrintAndLogEx(FAILED, "--kref must be 0..255");
+        return PM3_EINVARG;
+    }
+
+    memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+    memcpy(s_sam_sc.master_key, master_key, 16);
+    s_sam_sc.kref = (uint8_t)kref;
+
+    PrintAndLogEx(INFO, "KREF       : 0x%02X", s_sam_sc.kref);
+    PrintAndLogEx(INFO, "Master key : %s", sprint_hex_inrow(master_key, 16));
+
+    // ---------------- Initialize the SAM ----------------
+    // Run the equivalent of `hf iclass sam --info` first. This:
+    //   - Resets the SAM via I2C (CMD_HF_SAM_PICOPASS dispatcher)
+    //   - Sends sam_get_version + sam_get_serial_number as a warmup
+    //   - Prints the version + serial to the user
+    // The InitAuth that follows then reaches a SAM in a known clean state.
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "--- Initializing SAM ('hf iclass sam --info') ---");
+    int init_rc = CmdHFiClassSAMExtract("--info");
+    if (init_rc != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "SAM init returned rc=%d; continuing with InitAuth anyway", init_rc);
+    }
+    PrintAndLogEx(INFO, "--- Opening secure channel ---");
+    PrintAndLogEx(INFO, "");
+
+    // ---------------- InitAuth ----------------
+    uint8_t init_auth[23];
+    sam_sc_build_init_auth(s_sam_sc.kref, s_sam_sc.rnd_a, init_auth);
+
+    uint8_t resp[PM3_CMD_DATA_SIZE];
+    uint16_t resp_len = sizeof(resp);
+    uint8_t sam_flag = 0;
+    int rc = sam_sc_dispatch(SAM_SC_FLAG_FORCE_RESET, 0x00,
+                             init_auth, sizeof(init_auth),
+                             &sam_flag, resp, &resp_len);
+    if (rc != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "InitAuth dispatch failed (rc=%d)", rc);
+        return rc;
+    }
+    if (verbose)
+        PrintAndLogEx(DEBUG, "InitAuth scFlag=0x%02X resp(%u): %s",
+                      sam_flag, resp_len, sprint_hex_inrow(resp, resp_len));
+
+    if (resp_len < 36) {
+        PrintAndLogEx(FAILED, "InitAuth response too short (%u bytes)", resp_len);
+        if (verbose) PrintAndLogEx(DEBUG, "raw: %s", sprint_hex_inrow(resp, resp_len));
+        return PM3_ESOFT;
+    }
+    if (resp[0] != 0xBD || resp[2] != 0x8A || resp[3] != 0x20) {
+        PrintAndLogEx(FAILED, "InitAuth response shape unexpected: %02X %02X %02X %02X ...",
+                      resp[0], resp[1], resp[2], resp[3]);
+        if (verbose) PrintAndLogEx(DEBUG, "raw: %s", sprint_hex_inrow(resp, resp_len));
+        return PM3_ESOFT;
+    }
+    memcpy(s_sam_sc.suid, resp + 4, 8);
+    memcpy(s_sam_sc.rnd_b, resp + 12, 8);
+    uint8_t server_cryptogram[16];
+    memcpy(server_cryptogram, resp + 20, 16);
+    s_sam_sc.sc_flag = sam_flag;
+
+    PrintAndLogEx(INFO, "scFlag     : 0x%02X (SAM-assigned)", s_sam_sc.sc_flag);
+    PrintAndLogEx(INFO, "Server UID : %s", sprint_hex_inrow(s_sam_sc.suid, 8));
+    PrintAndLogEx(INFO, "Server RNDB: %s", sprint_hex_inrow(s_sam_sc.rnd_b, 8));
+    PrintAndLogEx(INFO, "ServerCrypt: %s", sprint_hex_inrow(server_cryptogram, 16));
+
+    // ---------------- Derive SCBK + session keys ----------------
+    {
+        uint8_t suid_data[16];
+        memcpy(suid_data, s_sam_sc.suid, 8);
+        for (int i = 0; i < 8; i++) suid_data[8 + i] = (uint8_t)(s_sam_sc.suid[i] ^ 0xFF);
+        uint8_t iv[16] = {0}, key_copy[16];
+        memcpy(key_copy, master_key, 16);
+        aes_encode(iv, key_copy, suid_data, s_sam_sc.scbk, 16);
+    }
+    static const uint8_t SC_PFX_MAC1[2] = {0x01, 0x01};
+    static const uint8_t SC_PFX_MAC2[2] = {0x01, 0x02};
+    static const uint8_t SC_PFX_ENC[2]  = {0x01, 0x82};
+    sam_sc_kdf_derive(s_sam_sc.scbk, SC_PFX_MAC1, s_sam_sc.rnd_b, s_sam_sc.s_mac1);
+    sam_sc_kdf_derive(s_sam_sc.scbk, SC_PFX_MAC2, s_sam_sc.rnd_b, s_sam_sc.s_mac2);
+    sam_sc_kdf_derive(s_sam_sc.scbk, SC_PFX_ENC,  s_sam_sc.rnd_b, s_sam_sc.s_enc);
+
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "SCBK : %s", sprint_hex_inrow(s_sam_sc.scbk, 16));
+        PrintAndLogEx(DEBUG, "sEnc : %s", sprint_hex_inrow(s_sam_sc.s_enc, 16));
+        PrintAndLogEx(DEBUG, "sMAC1: %s", sprint_hex_inrow(s_sam_sc.s_mac1, 16));
+        PrintAndLogEx(DEBUG, "sMAC2: %s", sprint_hex_inrow(s_sam_sc.s_mac2, 16));
+    }
+
+    uint8_t expected_srv[16];
+    {
+        uint8_t in[16], iv[16] = {0}, key_copy[16];
+        memcpy(in, s_sam_sc.rnd_a, 8);
+        memcpy(in + 8, s_sam_sc.rnd_b, 8);
+        memcpy(key_copy, s_sam_sc.s_enc, 16);
+        aes_encode(iv, key_copy, in, expected_srv, 16);
+    }
+    if (memcmp(expected_srv, server_cryptogram, 16) != 0) {
+        PrintAndLogEx(FAILED, _RED_("Server cryptogram mismatch") " - master key wrong for KREF 0x%02X",
+                      s_sam_sc.kref);
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "expected: %s", sprint_hex_inrow(expected_srv, 16));
+            PrintAndLogEx(DEBUG, "got     : %s", sprint_hex_inrow(server_cryptogram, 16));
+        }
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(SUCCESS, _GREEN_("InitAuth OK") " - server cryptogram verified");
+
+    // ---------------- ContinueAuth ----------------
+    uint8_t client_crypto[16];
+    {
+        uint8_t in[16], iv[16] = {0}, key_copy[16];
+        memcpy(in, s_sam_sc.rnd_b, 8);
+        memcpy(in + 8, s_sam_sc.rnd_a, 8);
+        memcpy(key_copy, s_sam_sc.s_enc, 16);
+        aes_encode(iv, key_copy, in, client_crypto, 16);
+    }
+    uint8_t client_cmac[16];
+    {
+        uint8_t iv0[16] = {0};
+        sam_sc_hid_mac(s_sam_sc.s_mac1, s_sam_sc.s_mac2, iv0, client_crypto, 16, client_cmac);
+    }
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "client_crypto: %s", sprint_hex_inrow(client_crypto, 16));
+        PrintAndLogEx(DEBUG, "client_cmac  : %s", sprint_hex_inrow(client_cmac, 16));
+    }
+
+    uint8_t cont_auth[40];
+    sam_sc_build_continue_auth(client_crypto, client_cmac, cont_auth);
+
+    resp_len = sizeof(resp);
+    rc = sam_sc_dispatch(0, s_sam_sc.sc_flag, cont_auth, sizeof(cont_auth),
+                         &sam_flag, resp, &resp_len);
+    if (rc != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "ContinueAuth dispatch failed (rc=%d)", rc);
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return rc;
+    }
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "ContinueAuth scFlag=0x%02X resp(%u): %s",
+                      sam_flag, resp_len, sprint_hex_inrow(resp, resp_len));
+    }
+    if (resp_len < 20) {
+        PrintAndLogEx(FAILED, "ContinueAuth response too short (%u bytes)", resp_len);
+        if (verbose) PrintAndLogEx(DEBUG, "raw: %s", sprint_hex_inrow(resp, resp_len));
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return PM3_ESOFT;
+    }
+    if (resp[0] != 0xBD || resp[2] != 0x8A || resp[3] != 0x10) {
+        PrintAndLogEx(FAILED, "ContinueAuth response shape unexpected: %02X %02X %02X %02X ...",
+                      resp[0], resp[1], resp[2], resp[3]);
+        if (verbose) PrintAndLogEx(DEBUG, "raw: %s", sprint_hex_inrow(resp, resp_len));
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return PM3_ESOFT;
+    }
+    uint8_t server_rmac[16];
+    memcpy(server_rmac, resp + 4, 16);
+
+    uint8_t expected_rmac[16];
+    {
+        uint8_t pad_block[16] = {0};
+        pad_block[0] = 0x80;
+        sam_sc_hid_mac(s_sam_sc.s_mac1, s_sam_sc.s_mac2, client_cmac,
+                       pad_block, 16, expected_rmac);
+    }
+    if (memcmp(expected_rmac, server_rmac, 16) != 0) {
+        PrintAndLogEx(FAILED, _RED_("ContinueAuth R-MAC mismatch") " - SAM did not authenticate");
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "expected: %s", sprint_hex_inrow(expected_rmac, 16));
+            PrintAndLogEx(DEBUG, "got     : %s", sprint_hex_inrow(server_rmac, 16));
+        }
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return PM3_ESOFT;
+    }
+
+    memcpy(s_sam_sc.c_mac, client_cmac, 16);
+    memcpy(s_sam_sc.r_mac, server_rmac, 16);
+    s_sam_sc.sc_flag = sam_flag;
+    s_sam_sc.open = true;
+
+    PrintAndLogEx(SUCCESS, _GREEN_("Secure channel OPEN") " (scFlag=0x%02X, KREF=0x%02X)",
+                  s_sam_sc.sc_flag, s_sam_sc.kref);
+    PrintAndLogEx(INFO, "Use 'hf iclass sam scsend' to send wrapped APDUs;");
+    PrintAndLogEx(INFO, "use 'hf iclass sam scclose' to terminate.");
+    return PM3_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// hf iclass sam scsend --payload <hex>
+// ---------------------------------------------------------------------------
+static int CmdHFiClassSAMSCSend(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf iclass sam scsend",
+                  "Send a plaintext SAMCommand body through the open secure\n"
+                  "channel. The client wraps it (encrypt + MAC + chain RMAC),\n"
+                  "sends via CMD_HF_SAM_SC, unwraps the response, and prints\n"
+                  "the plaintext. Requires 'scopen' to have been called first.\n"
+                  "Test payload: --payload 8200  (samCommandGetSamVersion)",
+                  "hf iclass sam scsend --payload 8200\n"
+                  "hf iclass sam scsend --payload b9028a00 -v\n"
+                  "hf iclass sam scsend --payload b903850100");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str1(NULL, "payload", "<hex>", "plaintext SAMCommand body (the bytes inside A0 <len>)"),
+        arg_lit0("v",  "verbose",          "verbose output"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    if (s_sam_sc.open == false) {
+        PrintAndLogEx(FAILED, "no open secure channel - run 'scopen' first");
+        CLIParserFree(ctx);
+        return PM3_ESOFT;
+    }
+
+    uint8_t plaintext[SAM_SC_MAX_FRAME];
+    int plaintext_len = 0;
+    if (CLIParamHexToBuf(arg_get_str(ctx, 1), plaintext, sizeof(plaintext), &plaintext_len) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (plaintext_len < 1) {
+        PrintAndLogEx(FAILED, "--payload must be at least 1 byte");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    bool verbose = arg_get_lit(ctx, 2);
+    CLIParserFree(ctx);
+
+    PrintAndLogEx(INFO, "Plaintext  : %s", sprint_hex_inrow(plaintext, plaintext_len));
+
+    uint8_t wrapped[SAM_SC_MAX_FRAME];
+    uint16_t wrapped_len = sam_sc_wrap(plaintext, (uint16_t)plaintext_len,
+                                       wrapped, sizeof(wrapped));
+    if (wrapped_len == 0) {
+        PrintAndLogEx(FAILED, "wrap() failed");
+        return PM3_ESOFT;
+    }
+    if (verbose)
+        PrintAndLogEx(DEBUG, "wrapped (%u): %s", wrapped_len, sprint_hex_inrow(wrapped, wrapped_len));
+
+    uint8_t sam_payload[SAM_SC_MAX_FRAME + 4];
+    uint16_t off = 0;
+    sam_payload[off++] = 0xA0;
+    off += sam_sc_emit_ber_len(sam_payload + off, wrapped_len);
+    if ((uint32_t)off + wrapped_len > sizeof(sam_payload)) {
+        PrintAndLogEx(FAILED, "wrapped payload too large for buffer");
+        return PM3_ESOFT;
+    }
+    memcpy(sam_payload + off, wrapped, wrapped_len);
+    off += wrapped_len;
+
+    uint8_t resp[PM3_CMD_DATA_SIZE];
+    uint16_t resp_len = sizeof(resp);
+    uint8_t sam_flag = 0;
+    int rc = sam_sc_dispatch(0, s_sam_sc.sc_flag,
+                             sam_payload, off, &sam_flag, resp, &resp_len);
+    if (rc != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "dispatch failed (rc=%d)", rc);
+        return rc;
+    }
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "scFlag=0x%02X resp(%u): %s",
+                      sam_flag, resp_len, sprint_hex_inrow(resp, resp_len));
+    }
+    if (sam_flag != s_sam_sc.sc_flag && verbose) {
+        PrintAndLogEx(WARNING, "SAM scFlag changed: was 0x%02X, now 0x%02X",
+                      s_sam_sc.sc_flag, sam_flag);
+    }
+
+    const uint8_t *inner = NULL;
+    uint16_t inner_len = 0;
+    char path = '?';
+    if (sam_sc_peel_envelope(resp, resp_len, &inner, &inner_len, &path) != 0) {
+        PrintAndLogEx(FAILED, "could not peel SAM response envelope");
+        if (verbose) PrintAndLogEx(DEBUG, "raw: %s", sprint_hex_inrow(resp, resp_len));
+        return PM3_ESOFT;
+    }
+    if (verbose)
+        PrintAndLogEx(DEBUG, "envelope=Path %c, inner ciphertext+MAC (%u): %s",
+                      path, inner_len, sprint_hex_inrow(inner, inner_len));
+
+    uint8_t plain_resp[SAM_SC_MAX_FRAME];
+    int plain_len = sam_sc_unwrap(inner, inner_len, plain_resp, sizeof(plain_resp));
+    if (plain_len < 0) {
+        PrintAndLogEx(FAILED, _RED_("unwrap failed") " - MAC mismatch or padding error");
+        if (verbose) PrintAndLogEx(DEBUG, "raw response: %s", sprint_hex_inrow(resp, resp_len));
+        return PM3_ESOFT;
+    }
+
+    if (path == 'C') {
+        PrintAndLogEx(WARNING, _YELLOW_("Path C errorResponse") " - SAM returned an error");
+    } else {
+        PrintAndLogEx(SUCCESS, _GREEN_("Decrypt OK") " (Path %c)", path);
+    }
+    PrintAndLogEx(INFO, "Plaintext response (%d): %s",
+                  plain_len, sprint_hex_inrow(plain_resp, plain_len));
+    return PM3_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// hf iclass sam scclose
+// ---------------------------------------------------------------------------
+static int CmdHFiClassSAMSCClose(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf iclass sam scclose",
+                  "Send Terminate (91 00) over the open SC and release the\n"
+                  "firmware-side SAM session.",
+                  "hf iclass sam scclose");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("v", "verbose", "verbose output"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    bool verbose = arg_get_lit(ctx, 1);
+    CLIParserFree(ctx);
+
+    if (s_sam_sc.open == false) {
+        PrintAndLogEx(WARNING, "no open secure channel - nothing to close");
+        return PM3_SUCCESS;
+    }
+
+    uint8_t terminate[2] = {0x91, 0x00};
+    uint8_t wrapped[64];
+    uint16_t wrapped_len = sam_sc_wrap(terminate, sizeof(terminate),
+                                       wrapped, sizeof(wrapped));
+    if (wrapped_len == 0) {
+        PrintAndLogEx(FAILED, "wrap() of Terminate failed - forcing local close");
+        memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+        return PM3_ESOFT;
+    }
+
+    uint8_t sam_payload[80];
+    uint16_t off = 0;
+    sam_payload[off++] = 0xA0;
+    off += sam_sc_emit_ber_len(sam_payload + off, wrapped_len);
+    memcpy(sam_payload + off, wrapped, wrapped_len);
+    off += wrapped_len;
+
+    uint8_t resp[PM3_CMD_DATA_SIZE];
+    uint16_t resp_len = sizeof(resp);
+    uint8_t sam_flag = 0;
+    int rc = sam_sc_dispatch(SAM_SC_FLAG_RELEASE, s_sam_sc.sc_flag,
+                             sam_payload, off, &sam_flag, resp, &resp_len);
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "Terminate scFlag=0x%02X resp(%u): %s",
+                      sam_flag, resp_len, sprint_hex_inrow(resp, resp_len));
+    }
+
+    memset(&s_sam_sc, 0, sizeof(s_sam_sc));
+
+    if (rc != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Terminate dispatch returned rc=%d - host state cleared anyway", rc);
+        return rc;
+    }
+    PrintAndLogEx(SUCCESS, _GREEN_("Secure channel closed"));
+    return PM3_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// hf iclass sam dispatcher
+// ---------------------------------------------------------------------------
+//
+// Backwards-compat router: when invoked without a subcommand keyword (or
+// with a flag-style argument like `--info` / `-d ...` / `-f ...`), defers
+// to the legacy PACS-extraction implementation (CmdHFiClassSAMExtract).
+// When the first word matches a known SC subcommand, dispatches to the
+// scopen / scsend / scclose / help handlers.
+//
+// So all of these continue to work:
+//   hf iclass sam                       (legacy default)
+//   hf iclass sam --info                (legacy SAM info)
+//   hf iclass sam -p -d <hex>           (legacy with flags)
+//   hf iclass sam -f hf-iclass-dump.bin (legacy emulate-from-file)
+// And these are new:
+//   hf iclass sam scopen
+//   hf iclass sam scsend --payload <hex>
+//   hf iclass sam scclose
+//   hf iclass sam help                  (lists the SC subcommands)
+// ---------------------------------------------------------------------------
+
+static int CmdHFiClassSAMHelp(const char *Cmd);
+
+// SC subcommand dispatch table. Note: no `help` entry here on purpose -
+// use `hf iclass sam --help` (or `-h`) for the SAM-level help. The bare-word
+// `help` keyword is still accepted as a deprecated alias (see sam_cmd_is_help_request).
+static command_t SAMSubCommandTable[] = {
+    {"scopen",  CmdHFiClassSAMSCOpen,  IfPm3Smartcard,  "Open Artemis SC (InitAuth + ContinueAuth); persists session"},
+    {"scsend",  CmdHFiClassSAMSCSend,  IfPm3Smartcard,  "Send wrapped SAMCommand body through the open SC"},
+    {"scclose", CmdHFiClassSAMSCClose, IfPm3Smartcard,  "Send Terminate; release the SC session"},
+    {NULL, NULL, NULL, NULL}
+};
+
+static int CmdHFiClassSAMHelp(const char *Cmd) {
+    (void)Cmd;
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(NORMAL, _YELLOW_("hf iclass sam") " - HID SAM operations");
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(NORMAL, "Secure-channel subcommands:");
+    CmdsHelp(SAMSubCommandTable);
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(NORMAL, "Legacy PACS-extraction flags (no subcommand, applied to " _YELLOW_("hf iclass sam") " directly):");
+    PrintAndLogEx(NORMAL, "      --info               get SAM version + serial number (also warms up the SAM)");
+    PrintAndLogEx(NORMAL, "  -d, --data <hex>         DER-encoded SAMCommand to send (raw, no SC)");
+    PrintAndLogEx(NORMAL, "  -s, --snmp               --data is in SNMP format without the A0/94 headers");
+    PrintAndLogEx(NORMAL, "  -p, --prevent            fake the e-purse update during PACS extraction");
+    PrintAndLogEx(NORMAL, "      --break              stop tag interaction at nr-mac (for SIO extract)");
+    PrintAndLogEx(NORMAL, "  -f, --file <fn>          emulate from a dump file instead of a real card");
+    PrintAndLogEx(NORMAL, "  -n, --nodetect           skip card detect + SetDetectedCardInfo");
+    PrintAndLogEx(NORMAL, "  -k, --keep               keep the field active after the command");
+    PrintAndLogEx(NORMAL, "  -t, --tlv                decode the response as TLV");
+    PrintAndLogEx(NORMAL, "      --shallow            shallow modulation");
+    PrintAndLogEx(NORMAL, "  -v, --verbose            verbose output");
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(NORMAL, "Examples:");
+    PrintAndLogEx(NORMAL, "  " _YELLOW_("hf iclass sam") "                    extract PACS via SAM (defaults)");
+    PrintAndLogEx(NORMAL, "  " _YELLOW_("hf iclass sam --info") "             get SAM version + serial (warmup ping)");
+    PrintAndLogEx(NORMAL, "  " _YELLOW_("hf iclass sam scopen") "             open Artemis secure channel");
+    PrintAndLogEx(NORMAL, "  " _YELLOW_("hf iclass sam scsend --payload 8200") "  send wrapped SAMCommand");
+    PrintAndLogEx(NORMAL, "  " _YELLOW_("hf iclass sam scclose") "            terminate the SC session");
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
+}
+
+// Returns true if Cmd consists solely of "-h", "--help", or the bare-word
+// "help" (with optional surrounding whitespace). Used to intercept help
+// requests before the dispatcher would otherwise forward them to the legacy
+// CLIParser. The bare-word "help" is kept as a deprecated alias - it's no
+// longer advertised in the subcommand table, but existing scripts/muscle
+// memory still resolve correctly.
+static bool sam_cmd_is_help_request(const char *Cmd) {
+    while (*Cmd == ' ' || *Cmd == '\t') Cmd++;
+    size_t len = 0;
+    while (Cmd[len] && Cmd[len] != ' ' && Cmd[len] != '\t') len++;
+    if (len == 0) return false;
+    // ensure standalone (no trailing args)
+    const char *tail = Cmd + len;
+    while (*tail == ' ' || *tail == '\t') tail++;
+    if (*tail != '\0') return false;
+    if (len == 2 && memcmp(Cmd, "-h", 2) == 0) return true;
+    if (len == 6 && memcmp(Cmd, "--help", 6) == 0) return true;
+    if (len == 4 && memcmp(Cmd, "help", 4) == 0) return true;
+    return false;
+}
+
+static int CmdHFiClassSAM(const char *Cmd) {
+    // Skip leading whitespace.
+    while (*Cmd == ' ' || *Cmd == '\t') Cmd++;
+
+    // `--help` / `-h` (standalone) -> SC-aware help instead of the legacy
+    // CLIParser's auto-help (which would hide the SC subcommands). The
+    // bare-word `help` is also accepted as a deprecated alias (no longer
+    // listed in the subcommand table but still resolves here).
+    if (sam_cmd_is_help_request(Cmd)) {
+        return CmdHFiClassSAMHelp(Cmd);
+    }
+
+    // No args or a flag-style invocation -> legacy PACS-extract implementation.
+    // Preserves `hf iclass sam`, `hf iclass sam --info`, `hf iclass sam -d ...`,
+    // `hf iclass sam -f ...` etc.
+    if (*Cmd == '\0' || *Cmd == '-') {
+        return CmdHFiClassSAMExtract(Cmd);
+    }
+
+    // Match the first word against known SC subcommands. The CmdsParse
+    // dispatcher would print help on no match, but we want unknown first
+    // words to fall through to the legacy implementation, so we check first.
+    size_t word_len = 0;
+    while (Cmd[word_len] && Cmd[word_len] != ' ' && Cmd[word_len] != '\t')
+        word_len++;
+
+    for (size_t i = 0; SAMSubCommandTable[i].Name != NULL; i++) {
+        const char *name = SAMSubCommandTable[i].Name;
+        size_t nl = strlen(name);
+        if (nl == word_len && memcmp(name, Cmd, word_len) == 0) {
+            clearCommandBuffer();
+            return CmdsParse(SAMSubCommandTable, Cmd);
+        }
+    }
+
+    // Unknown first word - defer to legacy (which will either parse it as a
+    // free-form arg or error out cleanly with its own help).
+    return CmdHFiClassSAMExtract(Cmd);
+}
+
+// ---------------------------------------------------------------------------
+// hf iclass liberate — detect and liberate MKF / iCopy-X cloned cards
+// ---------------------------------------------------------------------------
+
+// iCopy-X DRM keys
+static const uint8_t icopy_key_icl[PICOPASS_BLOCK_SIZE] = { 0x20, 0x20, 0x66, 0x66, 0x66, 0x66, 0x88, 0x88 };
+static const uint8_t icopy_key_ics[PICOPASS_BLOCK_SIZE] = { 0x66, 0x66, 0x20, 0x20, 0x66, 0x66, 0x88, 0x88 };
+
+// MKF 3DES key suffix (appended to CSN to form 16-byte 2-key 3DES key: CSN || suffix)
+static const uint8_t mkf_key_suffix[8] = { 0x05, 0x70, 0xF6, 0x9A, 0x06, 0x97, 0x5C, 0xD8 };
+
+// MKF expected plaintext for block 18
+static const uint8_t mkf_expected_pt[PICOPASS_BLOCK_SIZE] = { 0xCD, 0x00, 0x00, 0x00, 0xCD, 0xFF, 0xFF, 0xFF };
+
+#define MKF_KNOWN_BLOCK    ( 18 )
+
+typedef enum {
+    CARD_TYPE_UNKNOWN = 0,
+    CARD_TYPE_MKF,
+    CARD_TYPE_ICOPY_ICL,
+    CARD_TYPE_ICOPY_ICS,
+} liberate_card_type_t;
+
+static int iclass_mfk_selftest(void) {
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, "--------------- " _CYAN_("selftest") " -----------------------");
+
+    // Test vector: CSN E44B4403F8FF12E0, encrypted block 18 = B34E6C637CEDFE9C
+    // 3DES key = CSN || 0570F69A06975CD8 = E44B4403F8FF12E00570F69A06975CD8
+    // Expected plaintext = CD000000CDFFFFFF
+    const uint8_t tv_csn[8]   = { 0xE4, 0x4B, 0x44, 0x03, 0xF8, 0xFF, 0x12, 0xE0 };
+    const uint8_t tv_blk18[8] = { 0xB3, 0x4E, 0x6C, 0x63, 0x7C, 0xED, 0xFE, 0x9C };
+
+    // build 3DES key
+    uint8_t des_key[16] = {0};
+    memcpy(des_key, tv_csn, 8);
+    memcpy(des_key + 8, mkf_key_suffix, 8);
+
+    // decrypt
+    uint8_t decrypted[8] = {0};
+    mbedtls_des3_context des3_ctx;
+    mbedtls_des3_set2key_dec(&des3_ctx, des_key);
+    mbedtls_des3_crypt_ecb(&des3_ctx, tv_blk18, decrypted);
+    mbedtls_des3_free(&des3_ctx);
+
+    PrintAndLogEx(INFO, "CSN............ %s", sprint_hex_inrow(tv_csn, 8));
+    PrintAndLogEx(INFO, "Block 18 enc... %s", sprint_hex_inrow(tv_blk18, 8));
+    PrintAndLogEx(INFO, "2k3DES key..... %s", sprint_hex_inrow(des_key, 16));
+    PrintAndLogEx(INFO, "Decrypted...... %s", sprint_hex_inrow(decrypted, 8));
+
+    if (memcmp(decrypted, mkf_expected_pt, 8) == 0) {
+        PrintAndLogEx(SUCCESS, "MKF test ( %s )", _GREEN_("ok"));
+    } else {
+        PrintAndLogEx(FAILED, "MKF test ( %s )", _RED_("fail"));
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
+}
+
+static int CmdHFiClassLiberate(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf iclass liberate",
+                  "Detect and liberate MKF or iCopy-X cloned iCLASS cards.\n"
+                  "MKF cards: verifies block 18 signature, then zeroes it.\n"
+                  "iCopy-X cards: detects DRM key, then changes KD to default (ki 0).\n",
+                  "hf iclass liberate\n"
+                  "hf iclass liberate --selftest\n"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0(NULL, "shallow", "use shallow (ASK) reader modulation instead of OOK"),
+        arg_lit0("v", "verbose", "verbose output"),
+        arg_lit0(NULL, "selftest", "run MKF detection self-test"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool shallow_mod = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool selftest = arg_get_lit(ctx, 3);
+    CLIParserFree(ctx);
+
+    if (selftest) {
+        return iclass_mfk_selftest();
+    }
+
+    PrintAndLogEx(NORMAL, "");
+
+    // Select card, get CSN
+    uint8_t csn[PICOPASS_BLOCK_SIZE] = {0};
+    uint8_t CCNR[12] = {0};
+
+    if (select_only(csn, CCNR, true, shallow_mod) == false) {
+        DropField();
+        PrintAndLogEx(ERR, "Failed to select card");
+        return PM3_ESOFT;
+    }
+    DropField();
+
+    PrintAndLogEx(SUCCESS, "CSN: " _GREEN_("%s"), sprint_hex_inrow(csn, PICOPASS_BLOCK_SIZE));
+
+    liberate_card_type_t card_type = CARD_TYPE_UNKNOWN;
+    uint8_t drm_key[PICOPASS_BLOCK_SIZE] = {0};
+
+    // Try MKF detection — read block 18 with default key (ki 0)
+    PrintAndLogEx(INFO, "Checking for MKF signature...");
+    {
+        uint8_t blk18[PICOPASS_BLOCK_SIZE] = {0};
+        uint8_t key[PICOPASS_BLOCK_SIZE];
+        memcpy(key, iClass_Key_Table[0], PICOPASS_BLOCK_SIZE);
+
+        int res = iclass_read_block_ex(key, MKF_KNOWN_BLOCK, ICLASS_DEBIT_KEYTYPE, false, false, false,
+                                       verbose, true, shallow_mod, blk18, false, false);
+        if (res == PM3_SUCCESS) {
+            // build 2-key 3DES key: CSN || 0570F69A06975CD8
+            uint8_t des_key[16] = {0};
+            memcpy(des_key, csn, 8);
+            memcpy(des_key + 8, mkf_key_suffix, 8);
+
+            // decrypt block 18
+            uint8_t decrypted[8] = {0};
+            mbedtls_des3_context des3_ctx;
+            mbedtls_des3_set2key_dec(&des3_ctx, des_key);
+            mbedtls_des3_crypt_ecb(&des3_ctx, blk18, decrypted);
+            mbedtls_des3_free(&des3_ctx);
+
+            if (verbose) {
+                PrintAndLogEx(INFO, "Block 18..... %s", sprint_hex_inrow(blk18, 8));
+                PrintAndLogEx(INFO, "2k3DES key... %s", sprint_hex_inrow(des_key, 16));
+                PrintAndLogEx(INFO, "Decrypted.... %s", sprint_hex_inrow(decrypted, 8));
+            }
+
+            if (memcmp(decrypted, mkf_expected_pt, 8) == 0) {
+                PrintAndLogEx(SUCCESS, "Detected " _GREEN_("MKF card") ", block %u signature verified", MKF_KNOWN_BLOCK);
+                card_type = CARD_TYPE_MKF;
+            } else {
+                if (verbose) {
+                    PrintAndLogEx(INFO, "Not MFK. Block %u decrypted to %s", MKF_KNOWN_BLOCK, sprint_hex_inrow(decrypted, 8));
+                }
+            }
+        } else {
+            if (verbose) {
+                PrintAndLogEx(INFO, "Block %u read with ki 0 ( %s )", MKF_KNOWN_BLOCK, _RED_("fail"));
+            }
+        }
+    }
+
+    // Try iCopy-X detection — attempt auth with each DRM key
+    if (card_type == CARD_TYPE_UNKNOWN) {
+        PrintAndLogEx(INFO, "Checking for iCopy-X DRM keys...");
+
+        // try iCL key first
+        uint8_t dummy[PICOPASS_BLOCK_SIZE] = {0};
+        uint8_t key_icl[PICOPASS_BLOCK_SIZE];
+        memcpy(key_icl, icopy_key_icl, PICOPASS_BLOCK_SIZE);
+
+        int res = iclass_read_block_ex(key_icl, 6, ICLASS_DEBIT_KEYTYPE, false, false, false, verbose, true, shallow_mod, dummy, false, false);
+        if (res == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Detected " _GREEN_("iCopy-X iCL") ", DRM key 2020666666668888");
+            card_type = CARD_TYPE_ICOPY_ICL;
+            memcpy(drm_key, icopy_key_icl, PICOPASS_BLOCK_SIZE);
+        } else {
+            // try iCS key
+            uint8_t key_ics[PICOPASS_BLOCK_SIZE];
+            memcpy(key_ics, icopy_key_ics, PICOPASS_BLOCK_SIZE);
+
+            res = iclass_read_block_ex(key_ics, 6, ICLASS_DEBIT_KEYTYPE, false, false, false, verbose, true, shallow_mod, dummy, false, false);
+            if (res == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "Detected " _GREEN_("iCopy-X iCS") ", DRM key 6666202066668888");
+                card_type = CARD_TYPE_ICOPY_ICS;
+                memcpy(drm_key, icopy_key_ics, PICOPASS_BLOCK_SIZE);
+            }
+        }
+    }
+
+    PrintAndLogEx(NORMAL, "");
+
+    // Perform liberation
+    switch (card_type) {
+
+        case CARD_TYPE_MKF: {
+            // write all-zero block 18
+            PrintAndLogEx(INFO, "Zeroing block %u...", MKF_KNOWN_BLOCK);
+
+            uint8_t key[PICOPASS_BLOCK_SIZE];
+            memcpy(key, iClass_Key_Table[0], PICOPASS_BLOCK_SIZE);
+
+            int res = iclass_write_block(MKF_KNOWN_BLOCK, zeros, NULL, key, false, false, false, false, verbose, false, shallow_mod);
+            if (res == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "MFK block %u write ( %s )", MKF_KNOWN_BLOCK, _GREEN_("ok"));
+            } else {
+                PrintAndLogEx(ERR, "Write block %u ( %s )", MKF_KNOWN_BLOCK, _RED_("fail"));
+                return res;
+            }
+
+            // verify
+            uint8_t verify[PICOPASS_BLOCK_SIZE] = {0};
+            res = iclass_read_block_ex(key, MKF_KNOWN_BLOCK, ICLASS_DEBIT_KEYTYPE, false, false, false, verbose, true, shallow_mod, verify, false, false);
+            if (res != PM3_SUCCESS) {
+                PrintAndLogEx(WARNING, "Reading block %u ( %s )", MKF_KNOWN_BLOCK, _RED_("fail"));
+                return res;
+            }
+
+            if (memcmp(verify, zeros, PICOPASS_BLOCK_SIZE) == 0) {
+                PrintAndLogEx(SUCCESS, "Block %u cleared ( %s )", MKF_KNOWN_BLOCK, _GREEN_("ok"));
+            } else {
+                PrintAndLogEx(WARNING, "Block %u not cleared ( %s )", MKF_KNOWN_BLOCK, _RED_("fail"));
+            }
+            break;
+        }
+
+        case CARD_TYPE_ICOPY_ICL:
+        case CARD_TYPE_ICOPY_ICS: {
+            // change KD from DRM key to default key (ki 0)
+            PrintAndLogEx(INFO, "Changing KD from iCopy-X DRM key to default");
+
+            // calculate XOR div key
+            uint8_t xor_div_key[PICOPASS_BLOCK_SIZE] = {0};
+            HFiClassCalcNewKey(csn, drm_key, iClass_Key_Table[0], xor_div_key, false, false, verbose);
+
+            if (verbose) {
+                PrintAndLogEx(INFO, "XOR div key... %s", sprint_hex_inrow(xor_div_key, PICOPASS_BLOCK_SIZE));
+            }
+
+            // write XOR'd key to block 3 using current DRM key for auth
+            uint8_t auth_key[PICOPASS_BLOCK_SIZE];
+            memcpy(auth_key, drm_key, PICOPASS_BLOCK_SIZE);
+
+            int res = iclass_write_block(3, xor_div_key, NULL, auth_key, false, false, false, false, verbose, false, shallow_mod);
+            if (res == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "Change to default key ( %s )", _GREEN_("ok"));
+            } else {
+                PrintAndLogEx(ERR,  "Change to default key ( %s )", _RED_("fail"));
+                return res;
+            }
+
+            // verify — try reading block 6 with default key
+            uint8_t verify[PICOPASS_BLOCK_SIZE] = {0};
+            uint8_t default_key[PICOPASS_BLOCK_SIZE];
+            memcpy(default_key, iClass_Key_Table[0], PICOPASS_BLOCK_SIZE);
+
+            res = iclass_read_block_ex(default_key, 6, ICLASS_DEBIT_KEYTYPE, false, false, false,
+                                       verbose, true, shallow_mod, verify, false, false);
+            if (res == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "Verified default key ( %s )", _GREEN_("ok"));
+            } else {
+                PrintAndLogEx(WARNING, "Verified default key ( %s )", _RED_("fail"));
+            }
+            break;
+        }
+
+        case CARD_TYPE_UNKNOWN: {
+            PrintAndLogEx(INFO, "Card is neither MKF nor iCopy-X (or authentication failed)");
+            return PM3_ESOFT;
+        }
+
+        default: {
+            break;
+        }
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
+}
+
 static command_t CommandTable[] = {
     {"help",        CmdHelp,                    AlwaysAvailable, "This help"},
     {"list",        CmdHFiClassList,            AlwaysAvailable, "List iclass history"},
@@ -7702,6 +9234,7 @@ static command_t CommandTable[] = {
     {"wrbl",        CmdHFiClass_WriteBlock,     IfPm3Iclass,     "Write Picopass / iCLASS block"},
     {"creditepurse", CmdHFiClassCreditEpurse,   IfPm3Iclass,     "Credit epurse value"},
     {"tear",        CmdHFiClass_TearBlock,      IfPm3Iclass,     "Performs tearoff attack on iCLASS block"},
+    {"liberate",    CmdHFiClassLiberate,        IfPm3Iclass,     "Detect and liberate MKF / iCopy-X cloned cards"},
     {"-----------", CmdHelp,                    AlwaysAvailable, "--------------------- " _CYAN_("Recovery") " --------------------"},
 //    {"autopwn",     CmdHFiClassAutopwn,         IfPm3Iclass,     "Automatic key recovery tool for iCLASS"},
     {"chk",         CmdHFiClassCheckKeys,       IfPm3Iclass,     "Check keys"},
@@ -7727,7 +9260,7 @@ static command_t CommandTable[] = {
     {"managekeys",  CmdHFiClassManageKeys,      AlwaysAvailable, "Manage keys to use with iclass commands"},
     {"permutekey",  CmdHFiClassPermuteKey,      AlwaysAvailable, "Permute function from 'heart of darkness' paper"},
     {"-----------", CmdHelp,                    IfPm3Smartcard,  "----------------------- " _CYAN_("SAM") " -----------------------"},
-    {"sam",         CmdHFiClassSAM,             IfPm3Smartcard,  "SAM tests"},
+    {"sam",         CmdHFiClassSAM,             IfPm3Smartcard,  "SAM ops: PACS extract + secure channel (scopen/scsend/scclose)"},
     {NULL, NULL, NULL, NULL}
 };
 
@@ -7760,7 +9293,8 @@ int CmdHFiClass(const char *Cmd) {
 int info_iclass(bool shallow_mod) {
 
     iclass_card_select_t payload = {
-        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE)
+        .flags = (FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE),
+        .page = 0 // no page selection support for info yet
     };
 
     if (shallow_mod) {
@@ -7880,7 +9414,7 @@ int info_iclass(bool shallow_mod) {
         bool found_aa2 = false;
         uint8_t aa1_idx = 0;
         uint8_t key[PICOPASS_KEY_SIZE] = {0};
-        
+
         for (uint8_t i = 0; i < ARRAYLEN(iClass_Key_Table); i++) {
 
             memcpy(key, iClass_Key_Table[i], sizeof(key));

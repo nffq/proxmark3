@@ -372,13 +372,13 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                             while (tlv_offset + 2 <= received_tlv_len) {
 
                                 uint8_t tag = received_tlv[tlv_offset++];
-                                
+
                                 uint8_t length = received_tlv[tlv_offset++];
 
                                 if (length > received_tlv_len - tlv_offset) {
                                     break;
                                 }
-                                
+
                                 uint8_t *value = &received_tlv[tlv_offset];
                                 if (tag == 0x06) {
                                     if (length == msg->oid_len && memcmp(value, msg->oid, length) == 0) {
@@ -478,7 +478,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 uint8_t tlv_idx = 1 + offset;
 
                                 dynamic_response_info.response[tlv_idx++] = 0x7C; // Tag: mutual auth
-                                dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC) +2; // Length
+                                dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC) + 2; // Length
                                 dynamic_response_info.response[tlv_idx++] = 0x81; // Tag: request for RND.ICC
                                 dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC); // Length
                                 memcpy(dynamic_response_info.response + tlv_idx, RND_ICC, sizeof(RND_ICC));
@@ -631,9 +631,9 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                             // Check all requested OIDs and see if we support any
                             uint8_t tlv_offset = 0;
                             while (tlv_offset + 2 <= received_tlv_len) {
-                                
+
                                 uint8_t tag = received_tlv[tlv_offset];
-                                
+
                                 uint8_t length = received_tlv[tlv_offset + 1];
                                 if (length > received_tlv_len - tlv_offset - 2) {
                                     break;
@@ -649,7 +649,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                     recvd_cmac_length = length;
                                     recvd_cmac_offset = tlv_offset;
                                 }
-                                
+
                                 tlv_offset += 2 + length;
                             }
 

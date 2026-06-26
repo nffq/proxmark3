@@ -24,6 +24,14 @@
         "Type": "pacs"
     },
     {
+        "AID": "1010F6",
+        "Vendor": "VDE",
+        "Country": "DE",
+        "Name": "VDE EV charging",
+        "Description": "Found on a DESFire card.",
+        "Type": "payment system"
+    },
+    {
         "AID": "1023F5",
         "Vendor": "Integrated Control Technology Limited (ICT)",
         "Country": "NZ",
@@ -405,6 +413,14 @@
         "Country": "US",
         "Name": "Schlage Access Credential",
         "Description": "FKA aptiQ Access Credential",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CD6",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Verified Open Application",
+        "Description": "LEAF Verified Open Application",
         "Type": "pacs"
     },
     {
@@ -976,6 +992,14 @@
         "Type": "transport"
     },
     {
+        "AID": "818000",
+        "Vendor": "Cairo Metro",
+        "Country": "EG",
+        "Name": "Cairo Metro Card (CAI)",
+        "Description": "Cairo Metro Card",
+        "Type": "transport"
+    },
+    {
         "AID": "010000",
         "Vendor": "Consorcio Regional de Transportes Publicos Regulares de Madrid (CRTM) / AF Payments Inc (AFPI)",
         "Country": "ES / PH",
@@ -1456,6 +1480,14 @@
         "Type": "transport"
     },
     {
+        "AID": "7D0005",
+        "Vendor": "Rejsekort & Rejseplan A/S",
+        "Country": "DK",
+        "Name": "Rejsekort (DNK)",
+        "Description": "DNK Rejsekort",
+        "Type": "transport"
+    },
+    {
         "AID": "992CB5",
         "Vendor": "Umo Mobility via Cubic Transportation Systems",
         "Country": "US / CA",
@@ -1528,6 +1560,14 @@
         "Type": "transport"
     },
     {
+        "AID": "F213E0",
+        "Vendor": "San Diego Metropolitan Transit System (MTS)",
+        "Country": "US",
+        "Name": "PRONTO Card (SAN)",
+        "Description": "SAN PRONTO Card",
+        "Type": "transport"
+    },
+    {
         "AID": "EF2011",
         "Vendor": "Helsinki Region Transport (HRT)",
         "Country": "FI",
@@ -1552,6 +1592,22 @@
         "Type": "transport"
     },
     {
+        "AID": "F00230",
+        "Vendor": "Consorcio de Transportes de Bizkaia (CTB)",
+        "Country": "ES",
+        "Name": "Barik Card (BIO)",
+        "Description": "BIO Barik Card",
+        "Type": "transport"
+    },
+    {
+        "AID": "F121A0",
+        "Vendor": "Urban Mobility Center",
+        "Country": "BG",
+        "Name": "Sofia Mobile Transit Card",
+        "Description": "DESFire-based mobile transit card",
+        "Type": "transport"
+    },
+    {
         "AID": "F20330",
         "Vendor": "NJ Transit via Conduent Inc and G+D GmbH",
         "Country": "US",
@@ -1568,6 +1624,14 @@
         "Type": "transport"
     },
     {
+        "AID": "F20701",
+        "Vendor": "Abu Dhabi Mobility",
+        "Country": "AE",
+        "Name": "Hafilat Card (AUH)",
+        "Description": "AUH Hafilat Card",
+        "Type": "transport"
+    },
+    {
         "AID": "F21030",
         "Vendor": "Puget Sound Transit Agencies via Vix Technologies",
         "Country": "US",
@@ -1581,6 +1645,14 @@
         "Country": "NZ / CA",
         "Name": "Metrocard (CHC) / Arc (YEG)",
         "Description": "CHC FIDs: 00: Backup Data; 01/02: Trip History; 03: Card Balance",
+        "Type": "transport"
+    },
+    {
+        "AID": "F210C0",
+        "Vendor": "Ubian",
+        "Country": "SK",
+        "Name": "Ubian digital transit card",
+        "Description": "DESFire-based virtual transit card",
         "Type": "transport"
     },
     {
@@ -1712,6 +1784,22 @@
         "Type": "transport"
     },
     {
+        "AID": "F21420",
+        "Vendor": "Metrolinx via Accenture",
+        "Country": "CA",
+        "Name": "PRESTO Card (YYZ/YHM/YOW)",
+        "Description": "YYZ/YHM/YOW PRESTO Card",
+        "Type": "transport"
+    },
+    {
+        "AID": "F21450",
+        "Vendor": "Metropolitan Atlanta Rapid Transit Authority (MARTA)",
+        "Country": "US",
+        "Name": "MARTA Breeze Card (ATL)",
+        "Description": "ATL MARTA Breeze Card",
+        "Type": "transport"
+    },
+    {
         "AID": "F40110",
         "Vendor": "ITSO Ltd",
         "Country": "GB",
@@ -1750,6 +1838,14 @@
         "Country": "GB",
         "Name": "ITSO Smartcard / The Key Card / touch Card (GBR)",
         "Description": "UK National Smartcard Project // Provision of Citizen Services #5",
+        "Type": "transport"
+    },
+    {
+        "AID": "F88522",
+        "Vendor": "Ubian",
+        "Country": "SK",
+        "Name": "Ubian digital transit card (Secondary)",
+        "Description": "DESFire-based virtual transit card secondary application",
         "Type": "transport"
     },
     {

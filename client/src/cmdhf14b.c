@@ -59,15 +59,10 @@
 #define ST25_SIZE_4K     5
 
 
-typedef struct {
-    const char *desc;
-    const char *apdu;
-    const uint8_t apdulen;
-} transport_14b_apdu_t;
-
-
 // iso14b apdu input frame length
 static uint16_t apdu_frame_length = 0;
+static uint8_t prime_vt_addr = ISO14443B_PRIME_VT_ADDR_DEFAULT;
+static uint8_t prime_com_ra_cmd = ISO14443B_PRIME_COM_RA_START;
 //static uint16_t ats_fsc[] = {16, 24, 32, 40, 48, 64, 96, 128, 256};
 static bool apdu_in_framing_enable = true;
 
@@ -774,6 +769,22 @@ static void print_ct_general_info(void *vcard) {
     PrintAndLogEx(NORMAL, "");
 }
 
+static void print_prime_general_info(const iso14b_prime_card_select_t *card) {
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, "--- " _CYAN_("Type B' / Innovatron") " ---------------------");
+    PrintAndLogEx(SUCCESS, " V&T Ad : %02X", card->vt_addr);
+    PrintAndLogEx(SUCCESS, " Cmd    : %02X (REPGEN)", card->repgen_cmd);
+    PrintAndLogEx(SUCCESS, " DIV    : " _GREEN_("%s"), sprint_hex(card->div, sizeof(card->div)));
+    PrintAndLogEx(SUCCESS, " VerLog : %02X", card->verlog);
+    if (card->verlog & 0x80) {
+        PrintAndLogEx(SUCCESS, " Config : %02X", card->config);
+    }
+    if (card->atr_len) {
+        PrintAndLogEx(SUCCESS, " ATR    : %s", sprint_hex(card->atr, card->atr_len));
+    }
+    PrintAndLogEx(NORMAL, "");
+}
+
 static void print_hdr(void) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, " block#  | data        |lck| ascii");
@@ -1330,6 +1341,71 @@ static bool HF14B_ST_Info(bool verbose, bool do_aid_search) {
     return true;
 }
 
+int select_card_14443b_prime(bool disconnect, iso14b_prime_card_select_t *card, bool verbose) {
+
+    iso14b_raw_cmd_t packet = {
+        .flags = (ISO14B_CONNECT | ISO14B_SELECT_PRIME | ISO14B_CLEARTRACE),
+        .timeout = 0,
+        .rawlen = 0,
+    };
+
+    if (disconnect) {
+        packet.flags |= ISO14B_DISCONNECT;
+    }
+
+    clearCommandBuffer();
+    PacketResponseNG resp;
+    SendCommandNG(CMD_HF_ISO14443B_COMMAND, (uint8_t *)&packet, sizeof(iso14b_raw_cmd_t));
+    if (WaitForResponseTimeout(CMD_HF_ISO14443B_COMMAND, &resp, TIMEOUT) == false) {
+        if (verbose) {
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        }
+        return PM3_ETIMEOUT;
+    }
+
+    switch (resp.status) {
+        case PM3_SUCCESS: {
+            if (resp.length < sizeof(iso14b_prime_card_select_t)) {
+                if (verbose) {
+                    PrintAndLogEx(FAILED, "ISO 14443-B' card select response too short (%u bytes)", resp.length);
+                }
+                return PM3_ELENGTH;
+            }
+
+            iso14b_prime_card_select_t selected = {0};
+            memcpy(&selected, resp.data.asBytes, sizeof(selected));
+            if (selected.repgen_cmd != ISO14443B_PRIME_CMD_REPGEN || selected.atr_len > sizeof(selected.atr)) {
+                if (verbose) {
+                    PrintAndLogEx(FAILED, "ISO 14443-B' invalid card select response");
+                }
+                return PM3_EWRONGANSWER;
+            }
+
+            prime_vt_addr = selected.vt_addr;
+            prime_com_ra_cmd = ISO14443B_PRIME_COM_RA_START;
+            SetISODEPState(disconnect ? ISODEP_INACTIVE : ISODEP_NFCB_PRIME);
+            if (card) {
+                *card = selected;
+            }
+            return PM3_SUCCESS;
+        }
+        case PM3_ELENGTH:
+            if (verbose) PrintAndLogEx(FAILED, "ISO 14443-B' REPGEN wrong length");
+            break;
+        case PM3_ECRC:
+            if (verbose) PrintAndLogEx(FAILED, "ISO 14443-B' REPGEN CRC fail");
+            break;
+        case PM3_EWRONGANSWER:
+            if (verbose) PrintAndLogEx(FAILED, "ISO 14443-B' REPGEN wrong answer");
+            break;
+        default:
+            if (verbose) PrintAndLogEx(FAILED, "ISO 14443-B' APGEN failed");
+            break;
+    }
+
+    return resp.status;
+}
+
 // menu command to get and print all info known about any known 14b tag
 static int CmdHF14Binfo(const char *Cmd) {
     CLIParserContext *ctx;
@@ -1585,6 +1661,16 @@ static bool HF14B_picopass_reader(bool verbose) {
         }
     }
     return false;
+}
+
+static bool HF14B_prime_reader(bool verbose) {
+
+    iso14b_prime_card_select_t card = {0};
+    if (select_card_14443b_prime(true, &card, verbose) != PM3_SUCCESS) {
+        return false;
+    }
+    print_prime_general_info(&card);
+    return true;
 }
 
 // test for other 14b type tags (mimic another reader - don't have tags to identify)
@@ -2521,6 +2607,118 @@ int exchange_14b_apdu(uint8_t *datain, int datainlen, bool activate_field,
     return PM3_SUCCESS;
 }
 
+static uint8_t next_prime_com_ra_cmd(uint8_t cmd) {
+    return (cmd + 0x02) & 0x0F;
+}
+
+int exchange_14b_prime_apdu(uint8_t *datain, int datainlen, bool activate_field,
+                            bool leave_signal_on, uint8_t *dataout, int maxdataoutlen,
+                            int *dataoutlen, int user_timeout) {
+
+    if (dataoutlen == NULL || dataout == NULL || datainlen < 0 || datainlen > 0xFE || (datain == NULL && datainlen > 0)) {
+        return PM3_EINVARG;
+    }
+    *dataoutlen = 0;
+
+    if (activate_field) {
+        int selres = select_card_14443b_prime(false, NULL, false);
+        if (selres != PM3_SUCCESS) {
+            return selres;
+        }
+    }
+
+    uint8_t frame[PM3_CMD_DATA_SIZE] = {0};
+    const uint16_t frame_len = (uint16_t)datainlen + 3;
+    if (frame_len > sizeof(frame)) {
+        return PM3_EINVARG;
+    }
+
+    frame[0] = prime_vt_addr;
+    frame[1] = prime_com_ra_cmd;
+    frame[2] = (uint8_t)datainlen + 1;
+    if (datainlen > 0) {
+        memcpy(frame + 3, datain, datainlen);
+    }
+
+    uint32_t flags = ISO14B_RAW | ISO14B_APPEND_CRC;
+    uint32_t timeout = 0;
+    if (user_timeout > 0) {
+        flags |= ISO14B_SET_TIMEOUT;
+        if (user_timeout > MAX_14B_TIMEOUT_MS) {
+            user_timeout = MAX_14B_TIMEOUT_MS;
+            PrintAndLogEx(INFO, "set timeout to 4.9 seconds. The max we can wait for response");
+        }
+        timeout = (uint32_t)((13560 / 128) * user_timeout);
+    }
+
+    iso14b_raw_cmd_t *packet = (iso14b_raw_cmd_t *)calloc(1, sizeof(iso14b_raw_cmd_t) + frame_len);
+    if (packet == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    packet->flags = flags;
+    packet->timeout = timeout;
+    packet->rawlen = frame_len;
+    memcpy(packet->raw, frame, frame_len);
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ISO14443B_COMMAND, (uint8_t *)packet, sizeof(iso14b_raw_cmd_t) + packet->rawlen);
+    free(packet);
+
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_ISO14443B_COMMAND, &resp, MAX(APDU_TIMEOUT, user_timeout)) == false) {
+        if (leave_signal_on == false) {
+            switch_off_field_14b();
+        }
+        PrintAndLogEx(ERR, "APDU: reply timeout");
+        return PM3_ETIMEOUT;
+    }
+
+    if (resp.status != PM3_SUCCESS) {
+        if (leave_signal_on == false) {
+            switch_off_field_14b();
+        }
+        PrintAndLogEx(ERR, "APDU: no Type B' APDU response");
+        return resp.status;
+    }
+
+    const uint8_t *rx = resp.data.asBytes;
+    if (resp.length < 5 || check_crc(CRC_14443_B, rx, resp.length) == false) {
+        if (leave_signal_on == false) {
+            switch_off_field_14b();
+        }
+        return PM3_ECRC;
+    }
+
+    const uint8_t rx_len = rx[2];
+    if (rx[0] != prime_vt_addr || (rx[1] & 0x01) || rx_len == 0 || resp.length < (uint16_t)rx_len + 4) {
+        if (leave_signal_on == false) {
+            switch_off_field_14b();
+        }
+        return PM3_EWRONGANSWER;
+    }
+
+    const int apdu_len = rx_len - 1;
+    if (maxdataoutlen && apdu_len > maxdataoutlen) {
+        if (leave_signal_on == false) {
+            switch_off_field_14b();
+        }
+        PrintAndLogEx(ERR, "APDU: buffer too small ( " _RED_("%d") " ), needs " _YELLOW_("%d") " bytes", maxdataoutlen, apdu_len);
+        return PM3_ESOFT;
+    }
+
+    memcpy(dataout, rx + 3, apdu_len);
+    *dataoutlen = apdu_len;
+    prime_com_ra_cmd = next_prime_com_ra_cmd(prime_com_ra_cmd);
+
+    if (leave_signal_on == false) {
+        switch_off_field_14b();
+    }
+
+    return PM3_SUCCESS;
+}
+
 // ISO14443-4. 7. Half-duplex block transmission protocol
 static int CmdHF14BAPDU(const char *Cmd) {
     CLIParserContext *ctx;
@@ -2919,282 +3117,6 @@ static int CmdHF14BView(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
-static int CmdHF14BCalypsoRead(const char *Cmd) {
-
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf 14b calypso",
-                  "Reads out the contents of a ISO14443B Calypso card\n",
-                  "hf 14b calypso"
-                 );
-    void *argtable[] = {
-        arg_param_begin,
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-    CLIParserFree(ctx);
-
-    transport_14b_apdu_t cmds[] = {
-        {"Select ICC",        "\x94\xa4\x08\x00\x04\x3f\x00\x00\x02", 9},
-        {"- ICC",             "\x94\xb2\x01\x04\x1d", 5},
-        {"Select EnvHol",     "\x94\xa4\x08\x00\x04\x20\x00\x20\x01", 9},
-        {"- EnvHol1",         "\x94\xb2\x01\x04\x1d", 5},
-        {"Select EvLog",      "\x94\xa4\x08\x00\x04\x20\x00\x20\x10", 9},
-        {"- EvLog1",          "\x94\xb2\x01\x04\x1d", 5},
-        {"- EvLog2",          "\x94\xb2\x02\x04\x1d", 5},
-        {"- EvLog3",          "\x94\xb2\x03\x04\x1d", 5},
-        {"Select ConList",    "\x94\xa4\x08\x00\x04\x20\x00\x20\x50", 9},
-        {"- ConList",         "\x94\xb2\x01\x04\x1d", 5},
-        {"Select Contra",     "\x94\xa4\x08\x00\x04\x20\x00\x20\x20", 9},
-        {"- Contra1",         "\x94\xb2\x01\x04\x1d", 5},
-        {"- Contra2",         "\x94\xb2\x02\x04\x1d", 5},
-        {"- Contra3",         "\x94\xb2\x03\x04\x1d", 5},
-        {"- Contra4",         "\x94\xb2\x04\x04\x1d", 5},
-        {"Select Counter",    "\x94\xa4\x08\x00\x04\x20\x00\x20\x69", 9},
-        {"- Counter",         "\x94\xb2\x01\x04\x1d", 5},
-        {"Select SpecEv",     "\x94\xa4\x08\x00\x04\x20\x00\x20\x40", 9},
-        {"- SpecEv1",         "\x94\xb2\x01\x04\x1d", 5},
-        {"Select Purse",      "\x00\xa4\x00\x00\x02\x10\x15", 7},
-        {"- Purse1",          "\x00\xb2\x01\x04\x1d", 5},
-        {"- Purse2",          "\x00\xb2\x02\x04\x1d", 5},
-        {"- Purse3",          "\x00\xb2\x03\x04\x1d", 5},
-        {"Select Top Up",     "\x00\xa4\x00\x00\x02\x10\x14", 7},
-        {"- Topup1",          "\x00\xb2\x01\x04\x1d", 5},
-        {"Select 1TIC.ICA",   "\x00\xa4\x04\x00\x08\x31\x54\x49\x43\x2e\x49\x43\x41", 13},
-    };
-
-    /*
-    local CLA = '94'
-    local _calypso_cmds = {
-
-    -- Break down of command bytes:
-    --  A4 = select
-    --  Master File  3F00
-    --  0x3F = master file
-    --  0x00 = master file id, is constant to 0x00.
-
-    --  DF Dedicated File  38nn
-    --  can be seen as directories
-    --  0x38
-    --  0xNN  id
-    --  ["01.Select ICC file"] = '0294 a4 080004 3f00 0002',
-
-    --  EF Elementary File
-    --  EF1 Pin file
-    --  EF2 Key file
-    --  Grey Lock file
-    --  Electronic deposit file
-    --  Electronic Purse file
-    --  Electronic Transaction log file
-    */
-    bool activate_field = true;
-    bool leave_signal_on = true;
-    uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
-
-    for (int i = 0; i < ARRAYLEN(cmds); i++) {
-
-        int user_timeout = -1;
-        int resplen = 0;
-        int res = exchange_14b_apdu(
-                      (uint8_t *)cmds[i].apdu,
-                      cmds[i].apdulen,
-                      activate_field,
-                      leave_signal_on,
-                      response,
-                      PM3_CMD_DATA_SIZE,
-                      &resplen,
-                      user_timeout
-                  );
-
-        if (res != PM3_SUCCESS) {
-            PrintAndLogEx(FAILED, "sending command failed, aborting!");
-            switch_off_field_14b();
-            return res;
-        }
-
-        uint16_t sw = get_sw(response, resplen);
-        if (sw == ISO7816_OK) {
-            PrintAndLogEx(SUCCESS, "%-22s - %s", cmds[i].desc, sprint_hex(response, resplen - 2));
-        } else {
-            PrintAndLogEx(INFO, "%-22s - Sending command failed (%04x - %s).", cmds[i].desc, sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
-        }
-
-        activate_field = false;
-    }
-
-    switch_off_field_14b();
-    return PM3_SUCCESS;
-}
-
-static int CmdHF14BMobibRead(const char *Cmd) {
-
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf 14b mobib",
-                  "Reads out the contents of a ISO14443B Mobib card\n",
-                  "hf 14b mobib"
-                 );
-    void *argtable[] = {
-        arg_param_begin,
-        arg_lit0("o", "old", "for old cards"),
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-    bool old = arg_get_lit(ctx, 1);
-    CLIParserFree(ctx);
-
-    transport_14b_apdu_t cmds_v1[] = {
-        {"SELECT AID 1TIC.ICA",   "\x00\xa4\x04\x00\x08\x31\x54\x49\x43\x2e\x49\x43\x41", 13},
-        {"Select ICC file a",     "\x00\xa4\x00\x00\x02\x3f\x00", 7},
-        {"Select ICC file b",     "\x00\xa4\x00\x00\x02\x00\x02", 7},
-        {"- ICC",                 "\x00\xb2\x01\x04\x1d", 5},
-        {"Select Holder file",    "\x00\xa4\x00\x00\x02\x3f\x1c", 7},
-        {"- Holder1",             "\x00\xb2\x01\x04\x1d", 5},
-        {"- Holder2",             "\x00\xb2\x02\x04\x1d", 5},
-        {"Select EnvHol file a",  "\x00\xa4\x00\x00\x00", 5},
-        {"Select EnvHol file b",  "\x00\xa4\x00\x00\x02\x20\x00", 7},
-        {"Select EnvHol file c",  "\x00\xa4\x00\x00\x02\x20\x01", 7},
-        {"- EnvHol1",             "\x00\xb2\x01\x04\x1D", 5},
-        {"- EnvHol2",             "\x00\xb2\x02\x04\x1D", 5},
-        {"Select EvLog file",     "\x00\xa4\x00\x00\x02\x20\x10", 7},
-        {"- EvLog1",              "\x00\xb2\x01\x04\x1D", 5},
-        {"- EvLog2",              "\x00\xb2\x02\x04\x1D", 5},
-        {"- EvLog3",              "\x00\xb2\x03\x04\x1D", 5},
-        {"Select ConList file",   "\x00\xa4\x00\x00\x02\x20\x50", 7},
-        {"- ConList",             "\x00\xb2\x01\x04\x1D", 5},
-        {"Select Contra file",    "\x00\xa4\x00\x00\x02\x20\x20", 7},
-        {"- Contra1",             "\x00\xb2\x01\x04\x1D", 5},
-        {"- Contra2",             "\x00\xb2\x02\x04\x1D", 5},
-        {"- Contra3",             "\x00\xb2\x03\x04\x1D", 5},
-        {"- Contra4",             "\x00\xb2\x04\x04\x1D", 5},
-        {"- Contra5",             "\x00\xb2\x05\x04\x1D", 5},
-        {"- Contra6",             "\x00\xb2\x06\x04\x1D", 5},
-        {"- Contra7",             "\x00\xb2\x07\x04\x1D", 5},
-        {"- Contra8",             "\x00\xb2\x08\x04\x1D", 5},
-        {"- Contra9",             "\x00\xb2\x09\x04\x1D", 5},
-        {"- ContraA",             "\x00\xb2\x0a\x04\x1D", 5},
-        {"- ContraB",             "\x00\xb2\x0b\x04\x1D", 5},
-        {"- ContraC",             "\x00\xb2\x0c\x04\x1D", 5},
-        {"Select Counter file",   "\x00\xa4\x00\x00\x02\x20\x69", 7},
-        {"- Counter",             "\x00\xb2\x01\x04\x1D", 5},
-        {"Select LoadLog file a", "\x00\xa4\x00\x00\x00", 5},
-        {"Select LoadLog file b", "\x00\xa4\x00\x00\x02\x10\x00", 7},
-        {"Select LoadLog file c", "\x00\xa4\x00\x00\x02\x10\x14", 7},
-        {"- LoadLog",             "\x00\xb2\x01\x04\x1D", 5},
-        {"Select Purcha file",    "\x00\xa4\x00\x00\x02\x10\x15", 7},
-        {"- Purcha1",             "\x00\xb2\x01\x04\x1D", 5},
-        {"- Purcha2",             "\x00\xb2\x02\x04\x1D", 5},
-        {"- Purcha3",             "\x00\xb2\x03\x04\x1D", 5},
-        {"Select SpecEv file a",  "\x00\xa4\x00\x00\x00", 5},
-        {"Select SpecEv file b",  "\x00\xa4\x00\x00\x02\x20\x00", 7},
-        {"Select SpecEv file c",  "\x00\xa4\x00\x00\x02\x20\x40", 7},
-        {"- SpecEv1",             "\x00\xb2\x01\x04\x1D", 5},
-        {"- SpecEv2",             "\x00\xb2\x02\x04\x1D", 5},
-        {"- SpecEv3",             "\x00\xb2\x03\x04\x1D", 5},
-        {"- SpecEv4",             "\x00\xb2\x04\x04\x1d", 5},
-    };
-    transport_14b_apdu_t cmds_v2[] = {
-        {"SELECT AID ??",         "\x00\xa4\x04\x00\x0b\xa0\x00\x00\x02\x91\xd0\x56\x00\x01\x90\x01", 16},
-        // ShortEF=02: ICC
-        {"- ICC",                 "\x00\xb2\x01\x14\x1d", 5},
-        // ShortEF=06: ??, records length up to 0x20?
-        //{"- ShortEF=06",          "\x00\xb2\x01\x34\x1d", 5},
-        // ShortEF=1C: Holder, records length up to 0x30?
-        {"- Holder1",             "\x00\xb2\x01\xe4\x1d", 5},
-        {"- Holder2",             "\x00\xb2\x02\xe4\x1d", 5}, // extra
-        {"SELECT AID 1TIC.ICA",   "\x00\xa4\x04\x00\x0e\x31\x54\x49\x43\x2e\x49\x43\x41\xd0\x56\x00\x01\x91\x01\x00", 20},
-        // ShortEF=09: Contracts
-        {"- Contra1",             "\x00\xb2\x01\x4c\x1d", 5},
-        {"- Contra2",             "\x00\xb2\x02\x4c\x1d", 5},
-        {"- Contra3",             "\x00\xb2\x03\x4c\x1d", 5},
-        {"- Contra4",             "\x00\xb2\x04\x4c\x1d", 5},
-        {"- Contra5",             "\x00\xb2\x05\x4c\x1d", 5},
-        {"- Contra6",             "\x00\xb2\x06\x4c\x1d", 5},
-        {"- Contra7",             "\x00\xb2\x07\x4c\x1d", 5},
-        {"- Contra8",             "\x00\xb2\x08\x4c\x1d", 5},
-        {"- Contra9",             "\x00\xb2\x09\x4c\x1d", 5},
-        {"- ContraA",             "\x00\xb2\x0a\x4c\x1d", 5}, // extra
-        {"- ContraB",             "\x00\xb2\x0b\x4c\x1d", 5}, // extra
-        {"- ContraC",             "\x00\xb2\x0c\x4c\x1d", 5}, // extra
-        // ShortEF=19: Counter, length up to 0x24?
-        {"- Counter",             "\x00\xb2\x01\xcc\x1d", 5},
-        // ShortEF=17: Events
-        // ShortEF=1d: Special Events
-        {"- ? Ev1",               "\x00\xb2\x01\xbc\x1d", 5},
-        {"- SpecEv1",             "\x00\xb2\x01\xec\x1d", 5},
-        {"- ? Ev2",               "\x00\xb2\x02\xbc\x1d", 5},
-        {"- SpecEv2",             "\x00\xb2\x02\xec\x1d", 5},
-        {"- ? Ev3",               "\x00\xb2\x03\xbc\x1d", 5},
-        {"- SpecEv3",             "\x00\xb2\x03\xec\x1d", 5},
-        {"- ? Ev4",               "\x00\xb2\x04\xbc\x1d", 5},
-        {"- SpecEv4",             "\x00\xb2\x04\xec\x1d", 5},
-        // ShortEF=16: Contract Extensions
-        //{"- ? ContraExt",         "\x00\xb2\x0c\x4c\x1d", 5}, == ContraC
-        {"- ? ContraExt1",        "\x00\xb2\x01\xb4\x1d", 5},
-        {"- ? ContraExt2",        "\x00\xb2\x02\xb4\x1d", 5},
-        {"- ? ContraExt3",        "\x00\xb2\x03\xb4\x1d", 5},
-        {"- ? ContraExt4",        "\x00\xb2\x04\xb4\x1d", 5},
-        {"- ? ContraExt5",        "\x00\xb2\x05\xb4\x1d", 5},
-        {"- ? ContraExt6",        "\x00\xb2\x06\xb4\x1d", 5},
-        {"- ? ContraExt7",        "\x00\xb2\x07\xb4\x1d", 5},
-        {"- ? ContraExt8",        "\x00\xb2\x08\xb4\x1d", 5},
-        // ShortEF=1E: Best Contract?, length up to 0x30?
-        {"- ConList",             "\x00\xb2\x01\xf4\x1d", 5},
-        // ShortEF=01: ??, 1 records length up to 0x30?
-        // ShortEF=07: ??, 2 records length up to 0x30?
-        {"- ShortEF=07, rec1",    "\x00\xb2\x01\x3c\x1d", 5},
-        {"- ShortEF=07, rec2",    "\x00\xb2\x02\x3c\x1d", 5},
-        // ShortEF=08: ??, 3 records length up to 0x30?
-        // ShortEF=10: ??, 1 records length up to 0x24?
-        // ShortEF=11: ??, 1 records length up to 0x30?
-        // ShortEF=12: ??, 12 records length up to 0x15?
-        // ShortEF=13: ??, 4 records length up to 0x30?
-        // ShortEF=14: ??, 1 records length up to 0x20?
-        // ShortEF=15: ??, 8 records length up to 0x40?
-        // ShortEF=18: ??, 8 records length up to 0x40?
-        // ShortEF=1A: ??, 8 records length up to 0x30?
-        // ShortEF=1B: ??, 1 records length up to 0x18?
-        // ShortEF=1C: ??, 1 records length up to 0x18?
-    };
-    bool activate_field = true;
-    bool leave_signal_on = true;
-    uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
-
-    transport_14b_apdu_t *cmds = old ? cmds_v1 : cmds_v2;
-    int cmds_count = old ? ARRAYLEN(cmds_v1) : ARRAYLEN(cmds_v2);
-
-    for (int i = 0; i < cmds_count; i++) {
-
-        int user_timeout = -1;
-        int resplen = 0;
-        int res = exchange_14b_apdu(
-                      (uint8_t *)cmds[i].apdu,
-                      cmds[i].apdulen,
-                      activate_field,
-                      leave_signal_on,
-                      response,
-                      PM3_CMD_DATA_SIZE,
-                      &resplen,
-                      user_timeout
-                  );
-
-        if (res != PM3_SUCCESS) {
-            PrintAndLogEx(FAILED, "sending command failed, aborting!");
-            switch_off_field_14b();
-            return res;
-        }
-
-        uint16_t sw = get_sw(response, resplen);
-        if (sw == ISO7816_OK) {
-            PrintAndLogEx(SUCCESS, "%-22s - %s", cmds[i].desc, sprint_hex(response, resplen - 2));
-        } else {
-            PrintAndLogEx(INFO, "%-22s - Sending command failed (%04x - %s).", cmds[i].desc, sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
-        }
-        activate_field = false;
-    }
-
-    switch_off_field_14b();
-    return PM3_SUCCESS;
-}
-
 static int CmdHF14BSriTearoff(const char *Cmd) {
 
     CLIParserContext *ctx;
@@ -3320,7 +3242,7 @@ static int CmdHF14BSriTearoff(const char *Cmd) {
     }
 
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(HINT, "Hint: use " _YELLOW_("`hf 14b rdbl -b %d`") " to verify the block", blockno);
+    PrintAndLogEx(HINT, "Hint: Use " _YELLOW_("`hf 14b rdbl -b %d`") " to verify the block", blockno);
     return PM3_SUCCESS;
 }
 
@@ -3423,9 +3345,6 @@ static command_t CommandTable[] = {
     {"tearoff",   CmdHF14BSriTearoff,  IfPm3Iso14443b,  "Tear-off attack on ST25TB/SRx counter blocks"},
     {"view",      CmdHF14BView,        AlwaysAvailable, "Display content from tag dump file"},
     {"valid",     CmdSRIX4kValid,      AlwaysAvailable, "SRIX4 checksum test"},
-    {"---------", CmdHelp,             AlwaysAvailable, "------------------ " _CYAN_("Calypso / Mobib") " ------------------"},
-    {"calypso",   CmdHF14BCalypsoRead, IfPm3Iso14443b,  "Read contents of a Calypso card"},
-    {"mobib",     CmdHF14BMobibRead,   IfPm3Iso14443b,  "Read contents of a Mobib card"},
     {"---------", CmdHelp,             IfPm3Iso14443b,  "------------------------- " _CYAN_("Magic") " -----------------------"},
     {"setuid",    CmdHF14BSetUID,      IfPm3Iso14443b,   "Set UID for magic card"},
     {NULL, NULL, NULL, NULL}
@@ -3445,12 +3364,18 @@ int CmdHF14B(const char *Cmd) {
 // get and print all info known about any known 14b tag
 int infoHF14B(bool verbose, bool do_aid_search) {
 
+    clear_trace_14b();
+
     // try std 14b (atqb)
     if (HF14B_Std_Info(verbose, do_aid_search))
         return PM3_SUCCESS;
 
     // try ST 14b
     if (HF14B_ST_Info(verbose, do_aid_search))
+        return PM3_SUCCESS;
+
+    // try Type B' / Innovatron APGEN
+    if (HF14B_prime_reader(verbose))
         return PM3_SUCCESS;
 
     // try unknown 14b read commands (to be identified later)
@@ -3485,6 +3410,11 @@ int readHF14B(bool loop, bool verbose, bool read_plot) {
 
         // try ASK CT 14b
         found |= HF14B_ask_ct_reader(verbose);
+        if (found)
+            goto plot;
+
+        // try Type B' / Innovatron APGEN
+        found |= HF14B_prime_reader(verbose);
         if (found)
             goto plot;
 

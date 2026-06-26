@@ -34,10 +34,12 @@
 #include "iclass_cmd.h"
 #include "hfops.h"
 #include "iso14443a.h"
+#include "secc.h"
 #include "iso14443b.h"
 #include "iso15693.h"
 #include "thinfilm.h"
 #include "felica.h"
+#include "felicasim.h"
 #include "hitag2.h"
 #include "hitag2_crack.h"
 #include "hitagS.h"
@@ -68,6 +70,7 @@
 #include "sam_picopass.h"
 #include "sam_seos.h"
 #include "sam_mfc.h"
+#include "sam_sc.h"
 #include "cmac_calc.h"
 
 #ifdef WITH_LCD
@@ -90,40 +93,51 @@
 int g_dbglevel = DBG_ERROR;
 uint8_t g_trigger = 0;
 bool g_hf_field_active = false;
+bool g_hf_field_timeout_active = false;
 extern uint32_t _stack_start[], _stack_end[];
 common_area_t g_common_area __attribute__((section(".commonarea")));
 static int button_status = BUTTON_NO_CLICK;
 static bool allow_send_wtx = false;
+static uint32_t g_hf_field_activity_timeout_ms = 0;
 uint16_t g_tearoff_delay_us = 0;
 bool g_tearoff_enabled = false;
 uint8_t g_tearoff_skip = 0;
 
 int tearoff_hook(void) {
-    if (g_tearoff_enabled) {
-        if (g_tearoff_delay_us == 0) {
-            if (g_dbglevel >= DBG_ERROR) Dbprintf(_RED_("No tear-off delay configured!"));
-            g_tearoff_enabled = false;
-            return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
-        }
-        if (g_tearoff_skip > 0) {
-            if (g_dbglevel >= DBG_INFO) Dbprintf(_GREEN_("Tear-off skipped!"));
-            g_tearoff_skip--;
-            return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
-        }
-        SpinDelayUsPrecision(g_tearoff_delay_us);
-        FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
-        g_tearoff_enabled = false;
-        if (g_dbglevel >= DBG_INFO) Dbprintf(_YELLOW_("Tear-off triggered!"));
-        return PM3_ETEAROFF;
-    } else {
-        return PM3_SUCCESS;     // SUCCESS = the hook didn't do anything
+
+    if (g_tearoff_enabled == false) {
+        return PM3_SUCCESS;
     }
+
+    // tear off is happening...
+
+    if (g_tearoff_delay_us == 0) {
+
+        if (g_dbglevel >= DBG_ERROR) Dbprintf(_RED_("No tear-off delay configured!"));
+        g_tearoff_enabled = false;
+        return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
+    }
+
+    if (g_tearoff_skip > 0) {
+        if (g_dbglevel >= DBG_INFO) Dbprintf(_GREEN_("Tear-off skipped!"));
+        g_tearoff_skip--;
+        return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
+    }
+
+    SpinDelayUsPrecision(g_tearoff_delay_us);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    g_tearoff_enabled = false;
+
+    if (g_dbglevel >= DBG_INFO) Dbprintf(_YELLOW_("Tear-off triggered!"));
+
+    return PM3_ETEAROFF;
 }
 
 void hf_field_off(void) {
     FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
     LEDsoff();
     g_hf_field_active = false;
+    g_hf_field_timeout_active = false;
 }
 
 void send_wtx(uint16_t wtx) {
@@ -1001,6 +1015,17 @@ static void PacketReceived(PacketCommandNG *packet) {
             reply_ng(CMD_SET_TEAROFF, PM3_SUCCESS, NULL, 0);
             break;
         }
+        case CMD_SET_HF_FIELD_TIMEOUT: {
+            if (packet->length != sizeof(uint32_t)) {
+                reply_ng(CMD_SET_HF_FIELD_TIMEOUT, PM3_EINVARG, NULL, 0);
+                break;
+            }
+            uint32_t timeout_ms = 0;
+            memcpy(&timeout_ms, packet->data.asBytes, sizeof(timeout_ms));
+            g_hf_field_activity_timeout_ms = timeout_ms;
+            reply_ng(CMD_SET_HF_FIELD_TIMEOUT, PM3_SUCCESS, NULL, 0);
+            break;
+        }
         // always available
         case CMD_HF_DROPFIELD: {
             hf_field_off();
@@ -1029,9 +1054,9 @@ static void PacketReceived(PacketCommandNG *packet) {
         case CMD_LF_ACQ_RAW_ADC: {
             lf_sample_payload_t *payload = (lf_sample_payload_t *)packet->data.asBytes;
             if (payload->realtime) {
-                ReadLF_realtime(true);
+                ReadLF_realtime(true, payload->cotag);
             } else {
-                uint32_t bits = SampleLF(payload->verbose, payload->samples, true);
+                uint32_t bits = SampleLF(payload->verbose, payload->samples, true, payload->cotag);
                 reply_ng(CMD_LF_ACQ_RAW_ADC, PM3_SUCCESS, (uint8_t *)&bits, sizeof(bits));
             }
             break;
@@ -1058,7 +1083,7 @@ static void PacketReceived(PacketCommandNG *packet) {
         case CMD_LF_SNIFF_RAW_ADC: {
             lf_sample_payload_t *payload = (lf_sample_payload_t *)packet->data.asBytes;
             if (payload->realtime) {
-                ReadLF_realtime(false);
+                ReadLF_realtime(false, false);
             } else {
                 uint32_t bits = SniffLF(payload->verbose, payload->samples, true);
                 reply_ng(CMD_LF_SNIFF_RAW_ADC, PM3_SUCCESS, (uint8_t *)&bits, sizeof(bits));
@@ -1759,6 +1784,10 @@ static void PacketReceived(PacketCommandNG *packet) {
             felica_sendraw(packet);
             break;
         }
+        case CMD_HF_FELICA_SIMULATE: {
+            felicasim_standard(packet);
+            break;
+        }
         case CMD_HF_FELICALITE_SIMULATE: {
             struct p {
                 uint8_t uid[8];
@@ -1837,6 +1866,11 @@ static void PacketReceived(PacketCommandNG *packet) {
             reply_ng(CMD_HF_ISO14443A_SNIFF, PM3_SUCCESS, NULL, 0);
             break;
         }
+        case CMD_HF_HIDCONFIG_SNIFF: {
+            SniffHIDConfigCard((const hid_sniff_payload_t *)packet->data.asBytes);
+            reply_ng(CMD_HF_HIDCONFIG_SNIFF, PM3_SUCCESS, NULL, 0);
+            break;
+        }
         case CMD_HF_ISO14443A_READER: {
             ReaderIso14443a(packet);
             break;
@@ -1867,12 +1901,14 @@ static void PacketReceived(PacketCommandNG *packet) {
                 uint8_t ulauth_1a2_len;
                 uint8_t ulauth_1a1[16];
                 uint8_t ulauth_1a2[16];
+                bool ulauth_1a2_mirror;
             } PACKED;
             struct p *payload = (struct p *) packet->data.asBytes;
             SimulateIso14443aTagEx(payload->tagtype, payload->flags, payload->uid,
                                    payload->exitAfter, payload->rats, sizeof(payload->rats),
                                    payload->ulauth_1a1, payload->ulauth_1a1_len,
-                                   payload->ulauth_1a2, payload->ulauth_1a2_len
+                                   payload->ulauth_1a2, payload->ulauth_1a2_len,
+                                   payload->ulauth_1a2_mirror
                                   );  // ## Simulate iso14443a tag - pass tag type & UID
             break;
         }
@@ -1883,7 +1919,7 @@ static void PacketReceived(PacketCommandNG *packet) {
                 uint8_t uid[10];
                 uint8_t ats[20];
                 uint8_t aid[30];
-                uint8_t selectaid_response[100];
+                uint8_t selectaid_response[256];
                 uint8_t getdata_response[100];
                 uint32_t ats_len;
                 uint32_t aid_len;
@@ -1896,6 +1932,10 @@ static void PacketReceived(PacketCommandNG *packet) {
                                     payload->ats, payload->ats_len, payload->aid, payload->aid_len,
                                     payload->selectaid_response, payload->selectaid_response_len,
                                     payload->getdata_response, payload->getdata_response_len);
+            break;
+        }
+        case CMD_HF_HIDCONFIG_SIM: {
+            SimulateHIDConfigCard((const hid_sim_payload_t *) packet->data.asBytes);
             break;
         }
         case CMD_HF_ISO14443A_ANTIFUZZ: {
@@ -2323,17 +2363,11 @@ static void PacketReceived(PacketCommandNG *packet) {
             break;
         }
         case CMD_HF_ICLASS_READER: {
-            iclass_card_select_t *payload = (iclass_card_select_t *) packet->data.asBytes;
-            ReaderIClass(payload->flags);
+            ReaderIClass(packet->data.asBytes);
             break;
         }
         case CMD_HF_ICLASS_EML_MEMSET: {
-            //-----------------------------------------------------------------------------
-            // Note: we call FpgaDownloadAndGo(FPGA_BITSTREAM_HF_15) here although FPGA is not
-            // involved in dealing with emulator memory. But if it is called later, it might
-            // destroy the Emulator Memory.
-            //-----------------------------------------------------------------------------
-            FpgaDownloadAndGo(FPGA_BITSTREAM_HF_15);
+            FpgaDownloadAndGo_keep_EM(FPGA_BITSTREAM_HF_15);
             struct p {
                 uint16_t offset;
                 uint16_t len;
@@ -2446,8 +2480,8 @@ static void PacketReceived(PacketCommandNG *packet) {
 
             // sanity checks
             if (payload->bytes_in_packet > sizeof(payload->data) ||
-                payload->idx > BigBuf_get_size() ||
-                payload->idx + payload->bytes_in_packet > BigBuf_get_size()) {
+                    payload->idx > BigBuf_get_size() ||
+                    payload->idx + payload->bytes_in_packet > BigBuf_get_size()) {
                 reply_ng(CMD_SMART_UPLOAD, PM3_EOVFLOW, NULL, 0);
                 break;
             }
@@ -2496,6 +2530,11 @@ static void PacketReceived(PacketCommandNG *packet) {
 
         case CMD_HF_SAM_MFC: {
 //            sam_mfc_get_pacs();
+            break;
+        }
+
+        case CMD_HF_SAM_SC: {
+            sam_sc_handler(packet);
             break;
         }
 
@@ -2689,6 +2728,9 @@ static void PacketReceived(PacketCommandNG *packet) {
         }
         case CMD_FPGA_MAJOR_MODE_OFF: { // ## FPGA Control
             FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+            FpgaResetBitstream();
+            g_hf_field_active = false;
+            g_hf_field_timeout_active = false;
             SpinDelay(200);
             LED_D_OFF(); // LED D indicates field ON or OFF
             break;
@@ -3305,6 +3347,8 @@ void  __attribute__((noreturn)) AppMain(void) {
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
 
     StartTickCount();
+    uint32_t last_activity_tick = GetTickCount();
+    uint32_t last_activity_label = GetTickCountLabel();
 
 #ifdef WITH_LCD
     LCDInit();
@@ -3368,10 +3412,22 @@ void  __attribute__((noreturn)) AppMain(void) {
         int ret = receive_ng(&rx);
         if (ret == PM3_SUCCESS) {
             PacketReceived(&rx);
+            last_activity_label = GetTickCountLabel();
+            last_activity_tick = GetTickCount();
         } else if (ret != PM3_ENODATA) {
-
             Dbprintf("Error in frame reception: %d %s", ret, (ret == PM3_EIO) ? "PM3_EIO" : "");
             // TODO if error, shall we resync ?
+        }
+
+        if (g_hf_field_activity_timeout_ms > 0 && g_hf_field_timeout_active) {
+            uint32_t tickcount_label = GetTickCountLabel();
+            if (tickcount_label != last_activity_label) {
+                last_activity_label = tickcount_label;
+                last_activity_tick = GetTickCount();
+            } else if (GetTickCountDelta(last_activity_tick) >= g_hf_field_activity_timeout_ms) {
+                hf_field_off();
+                Dbprintf("HF field auto-off: inactivity timeout (%u ms). To disable, use 'prefs set hf.field.timeout_sec --sec 0'", g_hf_field_activity_timeout_ms);
+            }
         }
 
         // Press button for one second to enter a possible standalone mode

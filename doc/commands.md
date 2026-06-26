@@ -40,6 +40,7 @@ Check column "offline" for their availability.
 |`prefs get client.debug `|Y       |`Get client debug level preference`
 |`prefs get client.delay `|Y       |`Get client execution delay preference`
 |`prefs get client.timeout`|Y       |`Get client execution delay preference`
+|`prefs get hf.field.timeout_sec`|Y       |`Get PM3 HF field inactivity timeout preference`
 |`prefs get color        `|Y       |`Get color support preference`
 |`prefs get savepaths    `|Y       |`Get file folder  `
 |`prefs get emoji        `|Y       |`Get emoji display preference`
@@ -60,6 +61,7 @@ Check column "offline" for their availability.
 |`prefs set client.debug `|Y       |`Set client debug level`
 |`prefs set client.delay `|Y       |`Set client execution delay`
 |`prefs set client.timeout`|Y       |`Set client communication timeout`
+|`prefs set hf.field.timeout_sec`|Y       |`Set PM3 HF field inactivity timeout`
 |`prefs set color        `|Y       |`Set color support`
 |`prefs set emoji        `|Y       |`Set emoji display`
 |`prefs set hints        `|Y       |`Set hint display`
@@ -86,6 +88,7 @@ Check column "offline" for their availability.
 |`analyse demodbuff      `|Y       |`Load binary string to DemodBuffer`
 |`analyse freq           `|Y       |`Calc wave lengths`
 |`analyse foo            `|Y       |`muxer`
+|`analyse regex          `|Y       |`Regex utility (subset: ^ $ . * with \\ escape)`
 |`analyse units          `|Y       |`convert ETU <> US <> SSP_CLK (3.39MHz)`
 
 
@@ -231,8 +234,6 @@ Check column "offline" for their availability.
 |`hf 14b tearoff         `|N       |`Tear-off attack on ST25TB/SRx counter blocks`
 |`hf 14b view            `|Y       |`Display content from tag dump file`
 |`hf 14b valid           `|Y       |`SRIX4 checksum test`
-|`hf 14b calypso         `|N       |`Read contents of a Calypso card`
-|`hf 14b mobib           `|N       |`Read contents of a Mobib card`
 |`hf 14b setuid          `|N       |`Set UID for magic card`
 
 
@@ -285,6 +286,19 @@ Check column "offline" for their availability.
 |`hf aliro list          `|Y       |`List ISO 14443A/7816 history`
 |`hf aliro info          `|N       |`Get Aliro applet information`
 |`hf aliro read          `|N       |`Run SELECT-AUTH0-AUTH1 and optional step-up document retrieval`
+
+
+### hf calypso
+
+ { Calypso transport cards...          }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hf calypso help        `|Y       |`This help`
+|`hf calypso info        `|N       |`Tag information`
+|`hf calypso dump        `|N       |`Dump nodes after application profile scan`
+|`hf calypso probecmdcompat`|N       |`Probe SELECT command compatibility`
+|`hf calypso list        `|Y       |`List Calypso history`
 
 
 ### hf cipurse
@@ -351,6 +365,7 @@ Check column "offline" for their availability.
 |`hf felica wrbl         `|N       |`write block data to an authentication-not-required Service.`
 |`hf felica dump         `|N       |`Wait for and try dumping FeliCa`
 |`hf felica discnodes    `|N       |`discover Area Code and Service Code nodes.`
+|`hf felica sim          `|N       |`Emulate FeliCa Standard from dump file`
 |`hf felica rqservice    `|N       |`verify the existence of Area and Service, and to acquire Key Version.`
 |`hf felica rqresponse   `|N       |`verify the existence of a card and its Mode.`
 |`hf felica scsvcode     `|N       |`acquire Area Code and Service Code.`
@@ -377,6 +392,48 @@ Check column "offline" for their availability.
 |`hf fido auth           `|N       |`FIDO U2F Authentication Message.`
 |`hf fido make           `|N       |`FIDO2 MakeCredential command.`
 |`hf fido assert         `|N       |`FIDO2 GetAssertion command.`
+
+
+### hf fmcos
+
+ { FMCOS CPU cards...                  }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hf fmcos help          `|Y       |`This help`
+|`hf fmcos info          `|N       |`Detect card and print file-system info`
+|`hf fmcos select        `|N       |`SELECT FILE by 2-byte ID or AID name`
+|`hf fmcos erase         `|N       |`ERASE DF contents`
+|`hf fmcos createdir     `|N       |`CREATE DIRECTORY (DF)`
+|`hf fmcos createfile    `|N       |`CREATE EF (binary / fixed / variable / loop / wallet)`
+|`hf fmcos createkeyfile `|N       |`CREATE KEYFILE`
+|`hf fmcos readbinary    `|N       |`READ BINARY from transparent EF`
+|`hf fmcos readrecord    `|N       |`READ RECORD from record-based EF`
+|`hf fmcos writebinary   `|N       |`UPDATE BINARY in transparent EF`
+|`hf fmcos writerecord   `|N       |`UPDATE RECORD in record-based EF`
+|`hf fmcos append        `|N       |`APPEND RECORD to cyclic / linear EF`
+|`hf fmcos authexternal  `|N       |`EXTERNAL AUTHENTICATE using DES/3DES key`
+|`hf fmcos authinternal  `|N       |`INTERNAL AUTHENTICATE (card proves key knowledge)`
+|`hf fmcos key           `|N       |`WRITE KEY to keyfile`
+|`hf fmcos pinverify     `|N       |`VERIFY PIN (present PIN to card)`
+|`hf fmcos pinchange     `|N       |`CHANGE PIN (old + new, requires old PIN)`
+|`hf fmcos pinreset      `|N       |`RESET PIN (new PIN + change-PIN key MAC)`
+|`hf fmcos pinunblock    `|N       |`UNBLOCK PIN (encrypted new PIN + MAC)`
+|`hf fmcos balance       `|N       |`GET BALANCE (wallet or passbook)`
+|`hf fmcos credit        `|N       |`ADD CREDIT to wallet or passbook`
+|`hf fmcos purchase      `|N       |`PURCHASE from wallet or passbook`
+|`hf fmcos overdraft     `|N       |`UPDATE OVERDRAFT LIMIT`
+|`hf fmcos history       `|N       |`READ transaction history from loop EF`
+|`hf fmcos block         `|N       |`BLOCK card or application`
+|`hf fmcos unblock       `|N       |`UNBLOCK application`
+|`hf fmcos tidsetcard    `|N       |`SET CARD configuration block`
+|`hf fmcos tidsetuid     `|N       |`SET UID`
+|`hf fmcos tidsetauth    `|N       |`SET INTERNAL AUTH key`
+|`hf fmcos tiderase      `|N       |`ERASE TID card file system`
+|`hf fmcos tidprovision  `|N       |`Full TID provisioning sequence`
+|`hf fmcos tidcreatedf   `|N       |`CREATE sub-DF (TID format)`
+|`hf fmcos tidcreatebin  `|N       |`CREATE binary EF (TID format)`
+|`hf fmcos tidcreaterec  `|N       |`CREATE record EF (TID format)`
 
 
 ### hf fudan
@@ -422,6 +479,18 @@ Check column "offline" for their availability.
 |`hf gst read            `|N       |`Read and decode Google Smart Tap pass objects`
 
 
+### hf secc
+
+ { iClass SE Config Card Emulator...   }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hf secc help           `|Y       |`This help`
+|`hf secc info           `|N       |`Read and decode Card Recognition Data (GP tag 0066)`
+|`hf secc sim            `|N       |`Simulate HID iCLASS SE Config Card`
+|`hf secc sniff          `|N       |`Sniff reader<->card, jam A0 D4 APDU`
+
+
 ### hf iclass
 
  { ICLASS RFIDs...                     }
@@ -440,6 +509,7 @@ Check column "offline" for their availability.
 |`hf iclass wrbl         `|N       |`Write Picopass / iCLASS block`
 |`hf iclass creditepurse `|N       |`Credit epurse value`
 |`hf iclass tear         `|N       |`Performs tearoff attack on iCLASS block`
+|`hf iclass liberate     `|N       |`Detect and liberate MKF / iCopy-X cloned cards`
 |`hf iclass chk          `|N       |`Check keys`
 |`hf iclass loclass      `|Y       |`Use loclass to perform bruteforce reader attack`
 |`hf iclass lookup       `|Y       |`Uses authentication trace to check for key in dictionary file`
@@ -448,6 +518,7 @@ Check column "offline" for their availability.
 |`hf iclass unhash       `|Y       |`Reverses a diversified key to retrieve hash0 pre-images after DES encryption`
 |`hf iclass blacktears   `|N       |`Automated tearoff attack on new silicon cards to enable non-secure page mode`
 |`hf iclass sim          `|N       |`Simulate iCLASS tag`
+|`hf iclass tagsim       `|N       |`Simulate a full iCLASS 2K tag from FC/CN and keys`
 |`hf iclass eload        `|N       |`Upload file into emulator memory`
 |`hf iclass esave        `|N       |`Save emulator memory to file`
 |`hf iclass esetblk      `|N       |`Set emulator memory block data`
@@ -459,7 +530,7 @@ Check column "offline" for their availability.
 |`hf iclass decrypt      `|Y       |`Decrypt given block data or tag dump file`
 |`hf iclass managekeys   `|Y       |`Manage keys to use with iclass commands`
 |`hf iclass permutekey   `|Y       |`Permute function from 'heart of darkness' paper`
-|`hf iclass sam          `|N       |`SAM tests`
+|`hf iclass sam          `|N       |`SAM ops: PACS extract + secure channel (scopen/scsend/scclose)`
 
 
 ### hf ict
@@ -514,7 +585,9 @@ Check column "offline" for their availability.
 |`hf legic list          `|Y       |`List LEGIC history`
 |`hf legic rdbl          `|N       |`Read bytes from a LEGIC Prime tag`
 |`hf legic reader        `|N       |`LEGIC Prime Reader UID and tag info`
-|`hf legic restore       `|N       |`Restore a dump file onto a LEGIC Prime tag`
+|`hf legic restore       `|N       |`Restore an exact dump back onto the same LEGIC Prime card family`
+|`hf legic clone         `|N       |`Clone a LEGIC Prime dump to a new MCC or different tag`
+|`hf legic migrate       `|N       |`Clone a LEGIC Prime dump to a tag; DCF stays opt-in`
 |`hf legic wipe          `|N       |`Wipe a LEGIC Prime tag`
 |`hf legic wrbl          `|N       |`Write data to a LEGIC Prime tag`
 |`hf legic sim           `|N       |`Start tag simulator`
@@ -554,6 +627,7 @@ Check column "offline" for their availability.
 |`hf mf nested           `|N       |`Nested attack`
 |`hf mf hardnested       `|Y       |`Nested attack for hardened MIFARE Classic cards`
 |`hf mf staticnested     `|N       |`Nested attack against static nonce MIFARE Classic cards`
+|`hf mf sen              `|N       |`FM11RF08S Static Encrypted Nonce attack`
 |`hf mf brute            `|N       |`Smart bruteforce to exploit weak key generators`
 |`hf mf autopwn          `|N       |`Automatic key recovery tool for MIFARE Classic`
 |`hf mf nack             `|N       |`Test for MIFARE NACK bug`
@@ -568,6 +642,9 @@ Check column "offline" for their availability.
 |`hf mf info             `|N       |`Tag information`
 |`hf mf isen             `|N       |`Information Static Encrypted Nonces`
 |`hf mf mad              `|Y       |`Checks and prints MAD`
+|`hf mf madread          `|N       |`Read data from MAD AID sectors`
+|`hf mf madwrite         `|N       |`Write data to MAD AID sectors`
+|`hf mf madverify        `|N       |`Verify data in MAD AID sectors`
 |`hf mf personalize      `|N       |`Personalize UID (MIFARE Classic EV1 only)`
 |`hf mf rdbl             `|N       |`Read MIFARE Classic block`
 |`hf mf rdsc             `|N       |`Read MIFARE Classic sector`
@@ -623,11 +700,15 @@ Check column "offline" for their availability.
 |-------                  |------- |-----------
 |`hf mfp help            `|Y       |`This help`
 |`hf mfp list            `|Y       |`List MIFARE Plus history`
+|`hf mfp acl             `|Y       |`Decode ACL values for Mifare Plus`
 |`hf mfp auth            `|N       |`Authentication`
 |`hf mfp chk             `|N       |`Check keys`
 |`hf mfp dump            `|N       |`Dump MIFARE Plus tag to file`
 |`hf mfp info            `|N       |`Tag information`
 |`hf mfp mad             `|N       |`Check and print MAD`
+|`hf mfp madread         `|N       |`Read data from MAD AID sectors`
+|`hf mfp madwrite        `|N       |`Write data to MAD AID sectors`
+|`hf mfp madverify       `|N       |`Verify data in MAD AID sectors`
 |`hf mfp rdbl            `|N       |`Read blocks from card`
 |`hf mfp rdsc            `|N       |`Read sectors from card`
 |`hf mfp wrbl            `|N       |`Write block to card`
@@ -652,8 +733,10 @@ Check column "offline" for their availability.
 |`hf mfu keygen          `|Y       |`Generate DES/3DES/AES MIFARE diversified keys`
 |`hf mfu pwdgen          `|Y       |`Generate pwd from known algos`
 |`hf mfu otptear         `|N       |`Tear-off test on OTP bits`
+|`hf mfu countertear     `|N       |`Tear-off test on Ev1/NTAG Counter bits`
 |`hf mfu cauth           `|N       |`Ultralight-C - Authentication`
 |`hf mfu cchk            `|N       |`Ultralight-C - Authentication dictionary check`
+|`hf mfu desbrute        `|Y       |`Ultralight-C - 3DES key segment brute force`
 |`hf mfu aesauth         `|N       |`Ultralight-AES - Authentication`
 |`hf mfu aeschk          `|N       |`Ultralight-AES - Authentication dictionary check`
 |`hf mfu setkey          `|N       |`Ultralight C/AES - Set 3DES/AES keys`
@@ -689,7 +772,9 @@ Check column "offline" for their availability.
 |`hf mfdes detect        `|N       |`Detect key type and tries to find one from the list`
 |`hf mfdes formatpicc    `|N       |`Format PICC`
 |`hf mfdes freemem       `|N       |`Get free memory size`
+|`hf mfdes getversion    `|N       |`Get version/type information`
 |`hf mfdes getuid        `|N       |`Get uid from card`
+|`hf mfdes pc            `|N       |`Run proximity check`
 |`hf mfdes info          `|N       |`Tag information`
 |`hf mfdes mad           `|N       |`Prints MAD records / files from the card`
 |`hf mfdes setconfig     `|N       |`Set card configuration`
@@ -697,7 +782,10 @@ Check column "offline" for their availability.
 |`hf mfdes getaids       `|N       |`Get Application IDs list`
 |`hf mfdes getappnames   `|N       |`Get Applications list`
 |`hf mfdes bruteaid      `|N       |`Recover AIDs by bruteforce`
+|`hf mfdes brutedamslot  `|N       |`Recover DAM slots to delegated AIDs by bruteforce`
 |`hf mfdes createapp     `|N       |`Create Application`
+|`hf mfdes createdelegateapp`|N       |`Create Delegated Application`
+|`hf mfdes getdelegateappinfo`|N       |`Get Delegated Application info by DAM slot`
 |`hf mfdes deleteapp     `|N       |`Delete Application`
 |`hf mfdes selectapp     `|N       |`Select Application ID`
 |`hf mfdes selectisofid  `|N       |`Select file by ISO ID`
@@ -721,6 +809,11 @@ Check column "offline" for their availability.
 |`hf mfdes write         `|N       |`Write data to standard/backup/record/value file`
 |`hf mfdes value         `|N       |`Operations with value file (get/credit/limited credit/debit/clear)`
 |`hf mfdes clearrecfile  `|N       |`Clear record File`
+|`hf mfdes makemfclicense`|Y       |`Generate a Mifare Classic license for DESFire EV3C`
+|`hf mfdes createmfcmapping`|N       |`Create a Mifare Classic mapping on a DESFire EV3C`
+|`hf mfdes verifycert    `|N       |`Validate cert from file and verify key possession`
+|`hf mfdes intauth       `|N       |`ISO Internal Authenticate (ECDSA challenge-response)`
+|`hf mfdes vdesign       `|N       |`VDE ECDSASign (EV charging signature over 32-byte challenge)`
 |`hf mfdes test          `|Y       |`Regression crypto tests`
 
 
@@ -924,6 +1017,7 @@ Check column "offline" for their availability.
 |`lf config              `|N       |`Get/Set config for LF sampling, bit/sample, decimation, frequency`
 |`lf cmdread             `|N       |`Modulate LF reader field to send command before read`
 |`lf read                `|N       |`Read LF tag`
+|`lf relay               `|N       |`LF relay between two pm3 devices (tag/rdr mode)`
 |`lf search              `|Y       |`Read and Search for valid known tag`
 |`lf sim                 `|N       |`Simulate LF tag from buffer`
 |`lf simask              `|N       |`Simulate ASK tag`
@@ -957,7 +1051,7 @@ Check column "offline" for their availability.
 |command                  |offline |description
 |-------                  |------- |-----------
 |`lf cotag help          `|Y       |`This help`
-|`lf cotag demod         `|Y       |`demodulate an COTAG tag`
+|`lf cotag demod         `|Y       |`demodulate a COTAG tag`
 |`lf cotag reader        `|N       |`attempt to read and extract tag data`
 
 
@@ -1440,6 +1534,21 @@ Check column "offline" for their availability.
 |`lf visa2000 reader     `|N       |`attempt to read and extract tag data`
 |`lf visa2000 clone      `|N       |`clone Visa2000 tag to T55x7, Q5/T5555 or EM4305/4469`
 |`lf visa2000 sim        `|N       |`simulate Visa2000 tag`
+
+
+### mad
+
+ { MAD commands... }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`mad read               `|N       |`Read data from MAD AID sectors`
+|`mad write              `|N       |`Write data to MAD AID sectors`
+|`mad verify             `|N       |`Verify data in MAD AID sectors`
+|`mad help               `|Y       |`This help`
+|`mad decode             `|Y       |`Decode MAD byte array`
+|`mad encode             `|Y       |`Encode MAD byte array from AID mappings`
+|`mad test               `|Y       |`Run MAD regression tests`
 
 
 ### mem

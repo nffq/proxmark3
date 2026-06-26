@@ -79,9 +79,6 @@
 #include "commonutil.h"
 #include "BigBuf.h"
 
-#define DELAY_READER_AIR2ARM_AS_SNIFFER (2 + 3 + 8)
-#define DELAY_TAG_AIR2ARM_AS_SNIFFER (3 + 14 + 8)
-
 typedef enum {
     ST_LOOK_FOR_CARD = 0,
     ST_SNIFF_AUTH,
@@ -147,6 +144,7 @@ static bool find_tag(tag_t *tag_type) {
             }
             break;
         }
+        case 0x00:
         case 0x01: {
             if (iso14443a_select_card(NULL, &card, NULL, true, 0, true) == false) {
                 goto out;

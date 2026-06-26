@@ -92,12 +92,17 @@ uint16_t mifare_sendcmd(uint8_t cmd, uint8_t *data, uint8_t data_size, uint8_t *
 
     uint8_t dcmd[32 + 3];
     dcmd[0] = cmd;
+
     if (data_size > 0) {
         memcpy(dcmd + 1, data, data_size);
     }
+    data_size ++;
 
-    AddCrc14A(dcmd, data_size + 1);
-    ReaderTransmit(dcmd, sizeof(dcmd), timing);
+    AddCrc14A(dcmd, data_size);
+
+    data_size += 2;
+
+    ReaderTransmit(dcmd, data_size, timing);
     if (tearoff_hook() == PM3_ETEAROFF) { // tearoff occurred
         return 0;
     }
@@ -118,15 +123,17 @@ uint16_t mifare_sendcmd_schann(uint8_t *data, uint8_t data_size, uint8_t *answer
         return 0;
     }
 
-    uint8_t dcmd[16 + 2];
-    memset(dcmd, 0, sizeof(dcmd));
+    uint8_t dcmd[16 + 2] = {0};
 
     if (data_size > 0) {
         memcpy(dcmd, data, data_size);
     }
 
     AddCrc14A(dcmd, data_size);
-    ReaderTransmit(dcmd, sizeof(dcmd), timing);
+
+    data_size += 2;
+
+    ReaderTransmit(dcmd, data_size, timing);
 
     if (tearoff_hook() == PM3_ETEAROFF) { // tearoff occurred
         return 0;
@@ -141,10 +148,12 @@ uint16_t mifare_sendcmd_schann(uint8_t *data, uint8_t data_size, uint8_t *answer
 
 // send 2 byte commands
 uint16_t mifare_sendcmd_short(struct Crypto1State *pcs, uint8_t crypted, uint8_t cmd, uint8_t data, uint8_t *answer, uint16_t answer_len, uint8_t *answer_parity, uint32_t *timing) {
+
     uint16_t pos;
     uint8_t dcmd[4] = {cmd, data, 0x00, 0x00};
     uint8_t ecmd[4] = {0x00, 0x00, 0x00, 0x00};
     uint8_t par[MAX_MIFARE_PARITY_SIZE] = {0x00}; // used for cmd and answer
+
     AddCrc14A(dcmd, 2);
     memcpy(ecmd, dcmd, sizeof(dcmd));
 
@@ -170,7 +179,7 @@ uint16_t mifare_sendcmd_short(struct Crypto1State *pcs, uint8_t crypted, uint8_t
     }
 
     if (pcs && (crypted == CRYPT_ALL)) {
-        
+
         if (len == 1) {
             uint16_t res = 0;
             res |= (crypto1_bit(pcs, 0, 0) ^ BIT(answer[0], 0)) << 0;
@@ -374,8 +383,9 @@ int mifare_ul_ev1_auth(uint8_t *keybytes, uint8_t *pack) {
     uint8_t key[4] = {0x00, 0x00, 0x00, 0x00};
     memcpy(key, keybytes, 4);
 
-    if (g_dbglevel >= DBG_EXTENDED)
+    if (g_dbglevel >= DBG_EXTENDED) {
         Dbprintf("EV1 Auth : %02x%02x%02x%02x", key[0], key[1], key[2], key[3]);
+    }
 
     len = mifare_sendcmd(MIFARE_ULEV1_AUTH, key, sizeof(key), resp, sizeof(resp), respPar, NULL);
 
@@ -392,7 +402,7 @@ int mifare_ul_ev1_auth(uint8_t *keybytes, uint8_t *pack) {
     return 1;
 }
 
-int mifare_ultra_3des_auth(uint8_t *keybytes, bool check_answer) {
+int mifare_ultra_3des_auth(uint8_t *keybytes, bool try_auth, bool check_answer, uint8_t *nonce, uint8_t available_pairs, uint8_t *pairs) {
 
     /// 3des2k
     uint8_t random_a[8] = {1, 1, 1, 1, 1, 1, 1, 2};
@@ -410,6 +420,26 @@ int mifare_ultra_3des_auth(uint8_t *keybytes, bool check_answer) {
     len = mifare_sendcmd_short(NULL, CRYPT_NONE, MIFARE_ULC_AUTH_1, 0x00, resp, sizeof(resp), respPar, NULL);
     if (len != 11) {
         if (g_dbglevel >= DBG_ERROR) Dbprintf("Cmd Error: %02x - expected 11 got " _RED_("%u"), resp[0], len);
+        return 0;
+    }
+
+    if (nonce != NULL) {
+        memcpy(nonce, resp + 1, 8);
+    }
+    if (!try_auth) {
+        return 1;
+    }
+    if (available_pairs > 0) {
+        for (uint8_t i = 0; i < available_pairs; i++) {
+            if (memcmp(pairs + i * (8 + 16), resp + 1, 8) == 0) {
+                if (g_dbglevel >= DBG_EXTENDED) {
+                    Dbprintf("Known nonce found");
+                    Dbhexdump(8, resp + 1, false);
+                }
+                len = mifare_sendcmd(MIFARE_ULC_AUTH_2, pairs + i * (8 + 16) + 8, 16, resp, sizeof(resp), respPar, NULL);
+                return len == 11;
+            }
+        }
         return 0;
     }
 
@@ -470,7 +500,7 @@ int mifare_ultra_3des_auth(uint8_t *keybytes, bool check_answer) {
     return 1;
 }
 
-int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann, bool check_answer) {
+int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann, bool try_auth, bool check_answer, uint8_t *nonce) {
 
     /// aes-128
     uint8_t random_a[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2};
@@ -499,6 +529,12 @@ int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann, bool ch
         return 0;
     }
 
+    if (nonce != NULL) {
+        memcpy(nonce, resp + 1, 16);
+    }
+    if (!try_auth) {
+        return 1;
+    }
     // decrypt tag nonce.
     mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_DECRYPT, sizeof(random_b), IV, resp + 1, random_b);
 

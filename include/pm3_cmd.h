@@ -331,9 +331,11 @@ typedef struct {
 
 typedef struct {
     // 64KB SRAM -> 524288 bits(max sample num) < 2^30
-    uint32_t samples : LF_SAMPLES_BITS;
+    uint32_t samples :
+    LF_SAMPLES_BITS;
     bool realtime : 1;
     bool verbose : 1;
+    bool cotag : 1;
 } PACKED lf_sample_payload_t;
 
 typedef struct {
@@ -375,14 +377,19 @@ typedef struct {
 } PACKED mfc_eload_t;
 
 typedef struct {
-    uint8_t turn_off_field : 1;
-    uint8_t check_answer : 1;
-    uint8_t keyno : 2;
-    uint8_t use_schann : 1;
-    uint8_t use_fastread0 : 1;
-    uint8_t reserved : 2;
+    uint16_t turn_off_field : 1;
+    uint16_t try_auth : 1;
+    uint16_t check_answer : 1;
+    uint16_t keyno : 2;
+    uint16_t use_schann : 1;
+    uint16_t use_fastread0 : 1;
+    uint16_t get_nonces : 1;
+    uint16_t reset_field : 1;
+    uint16_t available_pairs : 4;
+    uint16_t reserved : 3;
     uint16_t retries;
     uint8_t key[16];
+    uint8_t pairs[(8 + 16) * 10]; // up to 10 pairs of ULC ERndB:ERndARndBp, 5 pairs of ULAES
 } PACKED mful_3passauth_t;
 
 enum {
@@ -531,6 +538,7 @@ typedef struct {
 #define CMD_TIA 0x0117
 #define CMD_BREAK_LOOP 0x0118
 #define CMD_SET_TEAROFF 0x0119
+#define CMD_SET_HF_FIELD_TIMEOUT 0x011A
 #define CMD_GET_DBGMODE 0x0120
 
 // RDV40, Flash memory operations
@@ -726,6 +734,8 @@ typedef struct {
 #define CMD_HF_ISO14443A_SNIFF 0x0383
 #define CMD_HF_ISO14443A_SIMULATE 0x0384
 #define CMD_HF_ISO14443A_SIM_AID 0x1420
+#define CMD_HF_HIDCONFIG_SIM     0x1421
+#define CMD_HF_HIDCONFIG_SNIFF   0x1422
 
 #define CMD_HF_ISO14443A_READER 0x0385
 #define CMD_HF_ISO14443A_EMV_SIMULATE 0x0386
@@ -888,6 +898,12 @@ typedef struct {
 #define CMD_HF_SAM_MFC 0x0902
 
 #define CMD_HF_SEOS_SIMULATE 0x0903
+
+// HID SAM secure-channel transport (separate dispatcher from CMD_HF_SAM_PICOPASS).
+// Used to drive InitAuth / ContinueAuth / wrap-unwrap traffic where the SAM's
+// session state must persist across calls (no I2C reset, no GetVersion ping,
+// no iso15 NFC-relay loop) and the routing scFlag byte must be host-supplied.
+#define CMD_HF_SAM_SC 0x0904
 
 #define CMD_UNKNOWN 0xFFFF
 

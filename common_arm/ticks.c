@@ -40,14 +40,16 @@ void SpinDelayUsPrecision(int us) {
     AT91C_BASE_PWMC_CH0->PWMC_CPRDR = 0xFFFF;                      // Channel Period Register
 
     uint16_t end = AT91C_BASE_PWMC_CH0->PWMC_CCNTR + ticks;
-    if (end == 0) // AT91C_BASE_PWMC_CH0->PWMC_CCNTR is never == 0
+    if (end == 0) { // AT91C_BASE_PWMC_CH0->PWMC_CCNTR is never == 0
         end++;    // so we have to end++ to avoid inivity loop
+    }
 
     for (;;) {
         uint16_t now = AT91C_BASE_PWMC_CH0->PWMC_CCNTR;
 
-        if (now == end)
+        if (now == end) {
             return;
+        }
 
         WDT_HIT();
     }
@@ -67,14 +69,16 @@ void SpinDelayUs(int us) {
     AT91C_BASE_PWMC_CH0->PWMC_CPRDR = 0xffff;                       // Channel Period Register
 
     uint16_t end = AT91C_BASE_PWMC_CH0->PWMC_CCNTR + ticks;
-    if (end == 0) // AT91C_BASE_PWMC_CH0->PWMC_CCNTR is never == 0
+    if (end == 0) { // AT91C_BASE_PWMC_CH0->PWMC_CCNTR is never == 0
         end++;    // so we have to end++ to avoid inivity loop
+    }
 
     for (;;) {
         uint16_t now = AT91C_BASE_PWMC_CH0->PWMC_CCNTR;
 
-        if (now == end)
+        if (now == end) {
             return;
+        }
         WDT_HIT();
     }
 }
@@ -97,7 +101,13 @@ void SpinDelay(int ms) {
 //    SpinDelay(1000);
 //    ti = GetTickCount() - ti;
 //    Dbprintf("timer(1s): %d t=%d", ti, GetTickCount());
+// Increments whenever StartTickCount() reconfigures/resets RTTC.
+// Callers can use this to detect that previously saved tick deltas are no longer valid.
+static uint32_t g_tickcount_label = 0;
+
 void StartTickCount(void) {
+    g_tickcount_label++;
+
     // This timer is based on the slow clock. The slow clock frequency is between 22kHz and 40kHz.
     // We can determine the actual slow clock frequency by looking at the Main Clock Frequency Register.
     while ((AT91C_BASE_PMC->PMC_MCFR & AT91C_CKGR_MAINRDY) == 0);       // Wait for MAINF value to become available...
@@ -120,6 +130,14 @@ uint32_t RAMFUNC GetTickCountDelta(uint32_t start_ticks) {
         return stop_ticks - start_ticks;
     }
     return (UINT32_MAX - start_ticks) + stop_ticks;
+}
+
+/*
+* Get current RTTC counter label.
+* If counter config changes between calls, the value is incremented.
+*/
+uint32_t GetTickCountLabel(void) {
+    return g_tickcount_label;
 }
 
 //  -------------------------------------------------------------------------

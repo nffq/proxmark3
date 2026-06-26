@@ -927,6 +927,8 @@ int CmdHF14ASim(const char *Cmd) {
         arg_lit0("v", "verbose", "verbose output"),
         arg_str0(NULL, "1a1", "<hex>", "<8|16> hex bytes ULC/ULAES Auth reply step1: ek(RndB)"),
         arg_str0(NULL, "1a2", "<hex>", "<8|16> hex bytes ULC/ULAES Auth reply step2: ek(RndA')"),
+        arg_lit0(NULL, "1a2-mirror", "Mirror ek(RndA) from step1 reply into step2 reply"),
+
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -966,6 +968,7 @@ int CmdHF14ASim(const char *Cmd) {
     uint8_t ulauth_1a2[16] = {0};
     CLIGetHexWithReturn(ctx, 7, ulauth_1a1, &ulauth_1a1_len);
     CLIGetHexWithReturn(ctx, 8, ulauth_1a2, &ulauth_1a2_len);
+    bool ulauth_1a2_mirror = arg_get_lit(ctx, 9);
     CLIParserFree(ctx);
 
     if (ulauth_1a1_len > 0) {
@@ -1026,6 +1029,7 @@ int CmdHF14ASim(const char *Cmd) {
         uint8_t ulauth_1a2_len;
         uint8_t ulauth_1a1[16];
         uint8_t ulauth_1a2[16];
+        bool ulauth_1a2_mirror;
     } PACKED payload;
 
     payload.tagtype = tagtype;
@@ -1033,6 +1037,7 @@ int CmdHF14ASim(const char *Cmd) {
     payload.exitAfter = exitAfterNReads;
     payload.ulauth_1a1_len = ulauth_1a1_len;
     payload.ulauth_1a2_len = ulauth_1a2_len;
+    payload.ulauth_1a2_mirror = ulauth_1a2_mirror;
     memcpy(payload.uid, uid, uid_len);
     memcpy(payload.ulauth_1a1, ulauth_1a1, ulauth_1a1_len);
     memcpy(payload.ulauth_1a2, ulauth_1a2, ulauth_1a2_len);
@@ -1163,7 +1168,7 @@ int ExchangeRAW14a(uint8_t *datain, int datainlen, bool activateField, bool leav
     uint8_t *recv;
     PacketResponseNG resp;
 resend:
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 1500)) {
+    if (WaitForResponseTimeout(CMD_ACK, &resp, 7000)) {
         recv = resp.data.asBytes;
         int iLen = resp.oldarg[0];
 
@@ -4393,7 +4398,7 @@ int CmdHF14AAIDSim(const char *Cmd) {
         arg_str0("u", "uid", "<hex>", "<4|7|10> hex bytes UID"),
         arg_str0("r", "ats", "<hex>", "<0-20> hex bytes ATS"),
         arg_str0("a", "aid", "<hex>", "<0-30> hex bytes for AID to respond to (Default: A000000000000000000000)"),
-        arg_str0("e", "selectaid_response", "<hex>", "<0-100> hex bytes for APDU Response to AID Select (Default: 9000)"),
+        arg_str0("e", "selectaid_response", "<hex>", "<0-256> hex bytes for APDU Response to AID Select (Default: 9000)"),
         arg_str0("p", "getdata_response", "<hex>", "<0-100> hex bytes for APDU Response to Get Data request after AID (Default: 9000)"),
         arg_lit0("x", "enumerate", "Enumerate all AID values via returning Not Found and print them to console "),
         arg_param_end
@@ -4410,7 +4415,7 @@ int CmdHF14AAIDSim(const char *Cmd) {
     uint8_t ats[20] = {0};
     uint8_t aid[30] = {0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     uint8_t default_aid_len = 11;
-    uint8_t selectaid_response[100] = {0x90, 0x00};
+    uint8_t selectaid_response[256] = {0x90, 0x00};
     uint8_t default_selectaid_response_len = 2;
     uint8_t getdata_response[100] = {0x90, 0x00};
     uint8_t default_getdata_response_len = 2;
@@ -4492,7 +4497,7 @@ int CmdHF14AAIDSim(const char *Cmd) {
         uint8_t uid[10];
         uint8_t ats[20];
         uint8_t aid[30];
-        uint8_t selectaid_response[100];
+        uint8_t selectaid_response[256];
         uint8_t getdata_response[100];
         uint32_t ats_len;
         uint32_t aid_len;

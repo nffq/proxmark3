@@ -522,22 +522,43 @@ static int DESFIRESendRaw(bool activate_field, uint8_t *data, size_t datalen, ui
     }
 
     if (*result_len < (1 + 2)) {
+        // In native mode of communication, DESFire cards don't seem to return
+        // a status byte for PROXIMITY_CHECK.
+        if (data[0] == MFDES_PROXIMITY_CHECK &&
+                *result_len >= 2) {
+            *result_len -= 2; // strip CRC only
+            if (respcode) {
+                *respcode = MFDES_S_OPERATION_OK;
+            }
+            return PM3_SUCCESS;
+        }
         return PM3_ECARDEXCHANGE;
     }
 
     *result_len -= (1 + 2);
 
     uint8_t rcode = result[0];
+    bool rcode_ok = (rcode == MFDES_S_OPERATION_OK ||
+                     rcode == MFDES_S_SIGNATURE ||
+                     rcode == MFDES_S_ADDITIONAL_FRAME ||
+                     rcode == MFDES_S_NO_CHANGES);
+
+    if (rcode_ok == false &&
+            data[0] == MFDES_PROXIMITY_CHECK) {
+        // Proximity-check response without native status byte:
+        // current *result_len is (rawlen - 3), but we only need to strip CRC.
+        *result_len += 1;
+        if (respcode) {
+            *respcode = MFDES_S_OPERATION_OK;
+        }
+        return PM3_SUCCESS;
+    }
+
     if (respcode) {
         *respcode = rcode;
     }
 
-    memmove(&result[0], &result[1], *result_len);
-
-    if (rcode != MFDES_S_OPERATION_OK &&
-            rcode != MFDES_S_SIGNATURE &&
-            rcode != MFDES_S_ADDITIONAL_FRAME &&
-            rcode != MFDES_S_NO_CHANGES) {
+    if (!rcode_ok) {
 
         if (GetAPDULogging()) {
             PrintAndLogEx(ERR, "Command (%02x) ERROR: 0x%02x", data[0], rcode);
@@ -545,10 +566,12 @@ static int DESFIRESendRaw(bool activate_field, uint8_t *data, size_t datalen, ui
 
         return PM3_EAPDU_FAIL;
     }
+
+    memmove(&result[0], &result[1], *result_len);
     return PM3_SUCCESS;
 }
 
-static int DesfireExchangeNative(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode, uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize) {
+static int DesfireExchangeNative(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode, uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize, size_t firsttxdatalen) {
     if (resplen) {
         *resplen = 0;
     }
@@ -576,11 +599,21 @@ static int DesfireExchangeNative(bool activate_field, DesfireContext_t *ctx, uin
 
     int res;
     size_t len;
+    size_t firsttxlen = 0;
+    if (firsttxdatalen > 0 && firsttxdatalen < datalen) {
+        firsttxlen = firsttxdatalen + 1; // +1 for the initial command byte.
+        if (firsttxlen > DESFIRE_TX_FRAME_MAX_LEN) {
+            firsttxlen = DESFIRE_TX_FRAME_MAX_LEN;
+        }
+    }
+
     // tx chaining
     size_t sentdatalen = 0;
-    while (cdatalen >= sentdatalen) {
+    while (cdatalen > sentdatalen) {
 
-        if ((cdatalen - sentdatalen) > DESFIRE_TX_FRAME_MAX_LEN) {
+        if (sentdatalen == 0 && firsttxlen > 0) {
+            len = firsttxlen;
+        } else if ((cdatalen - sentdatalen) > DESFIRE_TX_FRAME_MAX_LEN) {
             len = DESFIRE_TX_FRAME_MAX_LEN;
         } else {
             len = cdatalen - sentdatalen;
@@ -683,7 +716,7 @@ static int DesfireExchangeNative(bool activate_field, DesfireContext_t *ctx, uin
     return PM3_SUCCESS;
 }
 
-static int DesfireExchangeISONative(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode, uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize) {
+static int DesfireExchangeISONative(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode, uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize, size_t firsttxdatalen) {
     if (resplen) {
         *resplen = 0;
     }
@@ -711,10 +744,22 @@ static int DesfireExchangeISONative(bool activate_field, DesfireContext_t *ctx, 
     };
 
     int res;
+    size_t firsttxlen = 0;
+    if (firsttxdatalen > 0 && firsttxdatalen < datalen) {
+        firsttxlen = firsttxdatalen;
+        if (firsttxlen > DESFIRE_TX_FRAME_MAX_LEN) {
+            firsttxlen = DESFIRE_TX_FRAME_MAX_LEN;
+        }
+    }
+
     // tx chaining
     size_t sentdatalen = 0;
-    while (datalen >= sentdatalen) {
-        if (datalen - sentdatalen > DESFIRE_TX_FRAME_MAX_LEN) {
+    bool first_tx_frame = true;
+    while (first_tx_frame || datalen > sentdatalen) {
+        first_tx_frame = false;
+        if (sentdatalen == 0 && firsttxlen > 0) {
+            apdu.Lc = firsttxlen;
+        } else if (datalen - sentdatalen > DESFIRE_TX_FRAME_MAX_LEN) {
             apdu.Lc = DESFIRE_TX_FRAME_MAX_LEN;
         } else {
             apdu.Lc = datalen - sentdatalen;
@@ -874,8 +919,8 @@ static void DesfireSplitBytesToBlock(uint8_t *blockdata, size_t *blockdatacount,
     }
 }
 
-int DesfireExchangeEx(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode,
-                      uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize) {
+static int DesfireExchangeExSplit(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode,
+                                  uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize, size_t firsttxdatalen) {
     int res = PM3_SUCCESS;
 
     if (PrintChannelModeWarning(cmd, ctx->secureChannel, ctx->cmdSet, ctx->commMode) == false) {
@@ -896,9 +941,9 @@ int DesfireExchangeEx(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, u
             DesfireSecureChannelEncode(ctx, cmd, data, datalen, databuf, &databuflen);
 
             if (ctx->cmdSet == DCCNative) {
-                res = DesfireExchangeNative(activate_field, ctx, cmd, databuf, databuflen, respcode, databuf, &databuflen, enable_chaining, splitbysize);
+                res = DesfireExchangeNative(activate_field, ctx, cmd, databuf, databuflen, respcode, databuf, &databuflen, enable_chaining, splitbysize, firsttxdatalen);
             } else {
-                res = DesfireExchangeISONative(activate_field, ctx, cmd, databuf, databuflen, respcode, databuf, &databuflen, enable_chaining, splitbysize);
+                res = DesfireExchangeISONative(activate_field, ctx, cmd, databuf, databuflen, respcode, databuf, &databuflen, enable_chaining, splitbysize, firsttxdatalen);
             }
 
             if (splitbysize) {
@@ -924,6 +969,11 @@ int DesfireExchangeEx(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, u
 
     free(databuf);
     return res;
+}
+
+int DesfireExchangeEx(bool activate_field, DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode,
+                      uint8_t *resp, size_t *resplen, bool enable_chaining, size_t splitbysize) {
+    return DesfireExchangeExSplit(activate_field, ctx, cmd, data, datalen, respcode, resp, resplen, enable_chaining, splitbysize, 0);
 }
 
 int DesfireExchange(DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *respcode, uint8_t *resp, size_t *resplen) {
@@ -2134,8 +2184,16 @@ static int DesfireCommandRxData(DesfireContext_t *dctx, uint8_t cmd, uint8_t *re
     return DesfireCommand(dctx, cmd, NULL, 0, resp, resplen, checklength);
 }
 
+int DesfireCreateMFCMapping(DesfireContext_t *dctx, uint8_t *data, size_t datalen) {
+    return DesfireCommandTxData(dctx, MFDES_CREATE_MFC_MAPPING, data, datalen);
+}
+
 int DesfireFormatPICC(DesfireContext_t *dctx) {
     return DesfireCommandNoData(dctx, MFDES_FORMAT_PICC);
+}
+
+int DesfireGetVersion(DesfireContext_t *dctx, uint8_t *resp, size_t *resplen) {
+    return DesfireCommandRxData(dctx, MFDES_GET_VERSION, resp, resplen, 28);
 }
 
 int DesfireGetFreeMem(DesfireContext_t *dctx, uint32_t *freemem) {
@@ -2187,6 +2245,39 @@ int DesfireGetDFList(DesfireContext_t *dctx, uint8_t *resp, size_t *resplen) {
 
 int DesfireCreateApplication(DesfireContext_t *dctx, uint8_t *appdata, size_t appdatalen) {
     return DesfireCommandTxData(dctx, MFDES_CREATE_APPLICATION, appdata, appdatalen);
+}
+
+int DesfireCreateDelegatedApplication(DesfireContext_t *dctx, uint8_t *appdata, size_t appdatalen, uint8_t *contdata, size_t contdatalen) {
+    if (dctx == NULL || appdata == NULL || contdata == NULL) {
+        return PM3_EINVARG;
+    }
+
+    if (appdatalen == 0 || contdatalen == 0) {
+        return PM3_EINVARG;
+    }
+
+    if (appdatalen > DESFIRE_BUFFER_SIZE - contdatalen) {
+        return PM3_EINVARG;
+    }
+
+    uint8_t fulldata[DESFIRE_BUFFER_SIZE] = {0};
+    memcpy(fulldata, appdata, appdatalen);
+    memcpy(&fulldata[appdatalen], contdata, contdatalen);
+
+    uint8_t resp[DESFIRE_BUFFER_SIZE] = {0};
+    size_t resplen = 0;
+    uint8_t respcode = 0xFF;
+    // CreateDelegatedApplication must go out as C9 + AF frames, but secure messaging
+    // state (CMAC IV / cmd counter) must be advanced as a single logical command.
+    int res = DesfireExchangeExSplit(false, dctx, MFDES_CREATE_DELEGATE_APP, fulldata, appdatalen + contdatalen, &respcode, resp, &resplen, true, 0, appdatalen);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+    if (respcode != MFDES_S_OPERATION_OK) {
+        return PM3_EAPDU_FAIL;
+    }
+
+    return PM3_SUCCESS;
 }
 
 int DesfireDeleteApplication(DesfireContext_t *dctx, uint32_t aid) {

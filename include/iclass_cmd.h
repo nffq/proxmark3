@@ -52,6 +52,7 @@
 #define ICLASS_SIM_MODE_EXIT_AFTER_MAC        5  // note: device internal only
 #define ICLASS_SIM_MODE_FULL_GLITCH           6
 #define ICLASS_SIM_MODE_FULL_GLITCH_KEY       7
+#define ICLASS_SIM_MODE_FULL_LIVE             8  // FULL + USB poll for live emul updates (hf iclass tagsim)
 
 
 // iCLASS auth request data structure
@@ -79,6 +80,7 @@ typedef struct {
 // iCLASS dump data structure
 typedef struct {
     iclass_auth_req_t req;
+    uint8_t page;
     uint8_t start_block;
     uint8_t end_block;
 } PACKED iclass_dump_req_t;
@@ -128,7 +130,6 @@ typedef struct {
     bool test;
     bool fast;
     bool short_delay;
-    bool credit_recovery;
 } PACKED iclass_recover_req_t;
 
 typedef struct iclass_premac {
@@ -188,6 +189,7 @@ typedef struct {
 // reader flags
 typedef struct {
     uint8_t flags;
+    uint8_t page;
 } PACKED iclass_card_select_t;
 
 // reader flags

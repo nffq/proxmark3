@@ -11,6 +11,8 @@ TESTALL=false
 TESTDESFIREVALUE=false
 TESTHIDWIEGAND=false
 TESTMFHIDENCODE=false
+TESTICLASSREADER=false
+TESTICLASSEMU=false
 NEED_MF_HID_ENCODE_WIPE=false
 TESTMANUAL=false
 
@@ -20,12 +22,15 @@ while (( "$#" )); do
   case "$1" in
     -h|--help)
       echo """
-Usage: $0 [--pm3bin /path/to/pm3] [desfire_value|hid_wiegand|mf_hid_encode]
+Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|hid_wiegand|mf_hid_encode|iclass_emu|iclass_reader]
     --pm3bin ...:    Specify path to pm3 binary to test
+    --pm3port ...:   Specify serial port for client/proxmark3
     --manual ...:    Pause after successful online LF HID clone/read checks for external reader verification
     desfire_value:   Test DESFire value operations with card
     hid_wiegand:     Test LF HID T55xx clone and PM3 readback flows
     mf_hid_encode:   Test MIFARE Classic HID encoding flows
+    iclass_emu:      Test iCLASS emulator memory load/write/read flows
+    iclass_reader:   Load iCLASS HID credentials into emulator memory for external reader verification
     You must specify a test target - no default 'all' for online tests
 """
       exit 0
@@ -33,6 +38,15 @@ Usage: $0 [--pm3bin /path/to/pm3] [desfire_value|hid_wiegand|mf_hid_encode]
     --pm3bin)
       if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
         PM3BIN=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2
+        exit 1
+      fi
+      ;;
+    --pm3port)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        PM3PORT=$2
         shift 2
       else
         echo "Error: Argument for $1 is missing" >&2
@@ -56,6 +70,16 @@ Usage: $0 [--pm3bin /path/to/pm3] [desfire_value|hid_wiegand|mf_hid_encode]
     mf_hid_encode)
       TESTALL=false
       TESTMFHIDENCODE=true
+      shift
+      ;;
+    iclass_reader)
+      TESTALL=false
+      TESTICLASSREADER=true
+      shift
+      ;;
+    iclass_emu)
+      TESTALL=false
+      TESTICLASSEMU=true
       shift
       ;;
     -*|--*=) # unsupported flags
@@ -341,7 +365,7 @@ if command -v git >/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2
 fi
 
 # Check that user specified a test
-if [ "$TESTDESFIREVALUE" = false ] && [ "$TESTHIDWIEGAND" = false ] && [ "$TESTMFHIDENCODE" = false ]; then
+if [ "$TESTDESFIREVALUE" = false ] && [ "$TESTHIDWIEGAND" = false ] && [ "$TESTMFHIDENCODE" = false ] && [ "$TESTICLASSEMU" = false ] && [ "$TESTICLASSREADER" = false ]; then
   echo "Error: You must specify a test target. Use -h for help."
   exit 1
 fi
@@ -398,6 +422,40 @@ while true; do
       if ! CheckMfHidEncodeRoundTrip "hf mf encodehid format roundtrip"   "-w H10301 --fc 31 --cn 337" "10001111100000001010100011" "H10301.*FC: 31.*CN: 337"; then break; fi
       if ! RestoreMfHidEncodeCard; then break; fi
       if ! CheckMfHidEncodeCleanup "hf mf encodehid cleanup verify"; then break; fi
+    fi
+
+    if $TESTICLASSEMU; then
+      echo -e "\n${C_BLUE}Testing iCLASS emulator memory${C_NC} ${PM3BIN:=./pm3}"
+      if ! CheckFileExist "pm3 exists"               "$PM3BIN"; then break; fi
+      PM3CMD="$PM3BIN"
+      if [ -n "${PM3PORT:-}" ]; then
+        PM3CMD="$PM3CMD -p $PM3PORT"
+      fi
+      if ! CheckExecute "hf iclass esetblk preserves emu" "$PM3CMD -c 'hf iclass eload -f traces/iclass/hf-iclass-dump.json; hw fpgaoff; hf iclass esetblk --blk 7 -d A55AC33C9669F00F; hf iclass eview -s 64' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "0/0x00.*6D C2 5B 15 FE FF 12 E0.*7/0x07.*A5 5A C3 3C 96 69 F0 0F"; then break; fi
+      if ! CheckExecute "hf iclass sim preserves emu" "$PM3CMD -c 'hf iclass eload -f traces/iclass/hf-iclass-dump.json; hf iclass sim -t 3; hf iclass eview -s 64' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "6D C2 5B 15 FE FF 12 E0.*03 03 03 03 00 03 E0 17"; then break; fi
+      if ! CheckExecute "hf iclass sim break preserves emu" "$PM3CMD -c 'hf iclass eload -f traces/iclass/hf-iclass-dump.json; hf iclass sim -t 3; hw break; hf iclass eview -s 64' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "6D C2 5B 15 FE FF 12 E0.*03 03 03 03 00 03 E0 17"; then break; fi
+      if ! CheckExecute "hf iclass tagsim bin exits cleanly" "printf '\n' | $PM3CMD -c 'hf iclass tagsim --bin 10001111100000001010100011 --enc none; hf iclass eview -s 80' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "Uploaded .* bytes to emulator memory.*0/0x00.*6/0x06.*03 03 03 03 00 03 E0 14.*7/0x07.*00 00 00 00 06 3E 02 A3"; then break; fi
+      if ! CheckExecute "hf iclass tagsim bin back-to-back updates" "timeout 25 $PM3CMD -c 'hf iclass tagsim --bin 10001111100000001010100011 --enc none; hf iclass tagsim --bin 01010101010101010101010101010101 --enc none; hf iclass eview -s 80' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "7/0x07.*00 00 00 01 55 55 55 55"; then break; fi
+      if ! CheckExecute "hf iclass tagsim live update exits cleanly" "printf '\033[C' | $PM3CMD -c 'hf iclass tagsim -w H10301 --fc 31 --cn 337 --enc none; hf iclass eview -s 80' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "CN: 338.*0/0x00.*BD 0F 60 10 F7 FF 12 E0"; then break; fi
+      if ! CheckExecute "hf 15 uid sim resets emu state" "timeout 15 $PM3CMD -c 'hf 15 sim -u E011223344556677 -t 100; hf 15 eview' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "UID.*E0 11 22 33 44 55 66 77.*4 bytes / blocks x 64 blocks"; then break; fi
+    fi
+
+    if $TESTICLASSREADER; then
+      echo -e "\n${C_BLUE}Testing iCLASS reader verification${C_NC} ${PM3BIN:=./pm3}"
+      if ! CheckFileExist "pm3 exists"               "$PM3BIN"; then break; fi
+      PM3CMD="$PM3BIN"
+      if [ -n "${PM3PORT:-}" ]; then
+        echo "Using PM3 port: $PM3PORT"
+        PM3CMD="$PM3CMD -p $PM3PORT"
+      fi
+
+      WaitForEnter "PRESS ENTER TO START ICLASS PLAIN SIM, PRESENT THE PM3 TO ANOTHER READER, CONFIRM: iCLASS H10301 FC 31 CN 337, THEN PRESS THE PM3 BUTTON TO STOP SIM"
+      if ! CheckExecute "hf iclass emu reader plain"  "$PM3CMD -c 'hf iclass tagsim -w H10301 --fc 31 --cn 337 --enc none' 2>&1" "Uploaded .* bytes to emulator memory"; then break; fi
+      WaitForEnter "PRESS ENTER TO START ICLASS DES SIM, PRESENT THE PM3 TO ANOTHER READER, CONFIRM: iCLASS H10301 FC 31 CN 337, THEN PRESS THE PM3 BUTTON TO STOP SIM"
+      if ! CheckExecute "hf iclass emu reader des"    "$PM3CMD -c 'hf iclass tagsim -w H10301 --fc 31 --cn 337 --enc des' 2>&1" "Uploaded .* bytes to emulator memory"; then break; fi
+      WaitForEnter "PRESS ENTER TO START ICLASS 2K3DES SIM, PRESENT THE PM3 TO ANOTHER READER, CONFIRM: iCLASS H10301 FC 31 CN 337, THEN PRESS THE PM3 BUTTON TO STOP SIM"
+      if ! CheckExecute "hf iclass emu reader 2k3des" "$PM3CMD -c 'hf iclass tagsim -w H10301 --fc 31 --cn 337 --enc 2k3des' 2>&1" "Uploaded .* bytes to emulator memory"; then break; fi
+      if ! CheckExecute "hf iclass sim preserves emu" "$PM3CMD -c 'hf iclass eview -s 80' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "0/0x00.*BD 0C 60 10 F7 FF 12 E0.*6/0x06.*03 03 03 03 00 03 E0 17.*7/0x07.*10 A1 45 91 9E D1 6F 50"; then break; fi
     fi
   
   echo -e "\n------------------------------------------------------------"
